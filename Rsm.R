@@ -12,17 +12,10 @@
 
 suppressPackageStartupMessages({
   library(shiny)
-  library(shinydashboard)
-  library(shinyWidgets)
-  # Note: rsm package loaded for potential future enhancements (contour plots, canonical analysis)
-  # Current implementation uses standard lm() for flexibility with stepwise selection
-  library(rsm)
   library(dplyr)
-  library(tidyr)
   library(ggplot2)
   library(DT)
   library(plotly)
-  library(scales)
   library(bslib)
 })
 
@@ -78,9 +71,11 @@ custom_theme <- bs_theme(
   warning = COLORS$accent_orange,
 
   danger = COLORS$accent_red,
-  base_font = font_google("IBM Plex Sans"),
-  heading_font = font_google("IBM Plex Mono"),
-  code_font = font_google("IBM Plex Mono")
+  # local = FALSE: fonts are linked from Google Fonts (see <head>) instead of
+  # being downloaded at startup, so the app also starts offline
+  base_font = font_google("IBM Plex Sans", local = FALSE),
+  heading_font = font_google("IBM Plex Mono", local = FALSE),
+  code_font = font_google("IBM Plex Mono", local = FALSE)
 )
 
 custom_css <- sprintf("
@@ -435,7 +430,7 @@ table.dataTable tbody tr:hover td { background: %s !important; }
 #' @param max_levels Maximum number of unique levels to encode (higher → skip)
 #' @return List with:
 #'   - data: Modified data frame (original categorical columns removed, dummies added)
-#'   - mapping: Named list of { dummy_cols, reference, levels } per encoded column
+#'   - mapping: Named list of { dummy_cols, dummy_levels, reference, levels } per encoded column
 #'   - messages: Human-readable description of what was done
 encode_categorical <- function(df, max_levels = 10) {
   mapping <- list()
@@ -469,6 +464,7 @@ encode_categorical <- function(df, max_levels = 10) {
     levels_sorted <- sort(levels_raw)
     reference <- levels_sorted[1]
     dummy_names <- character(0)
+    chr_vals <- as.character(vals)
 
     # Create one dummy per non-reference level
     for (lvl in levels_sorted[-1]) {
@@ -477,12 +473,13 @@ encode_categorical <- function(df, max_levels = 10) {
       while (dummy_name %in% names(df)) {
         dummy_name <- paste0(dummy_name, "_d")
       }
-      df[[dummy_name]] <- as.integer(as.character(vals) == lvl)
+      df[[dummy_name]] <- as.integer(chr_vals == lvl)
       dummy_names <- c(dummy_names, dummy_name)
     }
 
     mapping[[col]] <- list(
       dummy_cols = dummy_names,
+      dummy_levels = levels_sorted[-1],  # level per dummy column (names may be de-duplicated)
       reference = reference,
       levels = levels_sorted
     )
@@ -500,15 +497,30 @@ encode_categorical <- function(df, max_levels = 10) {
   list(data = df, mapping = mapping, messages = messages)
 }
 
+#' Make column names usable as unique display/input keys
+#' Names may contain any characters (they never reach a formula), but they must
+#' be non-empty and unique.
+#' @param df Data frame
+#' @return Data frame with cleaned names
+sanitize_column_names <- function(df) {
+  nm <- trimws(names(df))
+  nm[is.na(nm) | nm == ""] <- paste0("V", which(is.na(nm) | nm == ""))
+  names(df) <- make.unique(nm, sep = "_")
+  df
+}
+
 #' Validate numeric data for RSM analysis
 #' @param X Matrix of predictors
 #' @param y Response vector
 #' @return List with validated data and diagnostics
 validate_data <- function(X, y) {
   issues <- character(0)
+  if (!is.matrix(X)) X <- as.matrix(X)
+  storage.mode(X) <- "double"
+  y <- suppressWarnings(as.numeric(y))
 
-  # Check for complete cases
-  complete_idx <- complete.cases(X, y)
+  # Check for complete cases (Inf/-Inf/NaN are treated as missing)
+  complete_idx <- rowSums(!is.finite(X)) == 0 & is.finite(y)
   n_missing <- sum(!complete_idx)
 
   if (n_missing > 0) {
@@ -518,11 +530,11 @@ validate_data <- function(X, y) {
   }
 
   # Check for constant columns (handle NA from single observation)
-  const_cols <- apply(X, 2, function(col) {
-    v <- var(col, na.rm = TRUE)
-    is.na(v) || v < .Machine$double.eps
-  })
-  if (any(const_cols, na.rm = TRUE)) {
+  const_cols <- vapply(seq_len(ncol(X)), function(i) {
+    col <- X[, i]
+    length(col) < 2 || all(col == col[1])
+  }, logical(1))
+  if (any(const_cols)) {
     const_names <- colnames(X)[const_cols]
     issues <- c(issues, sprintf("定数列を検出: %s", paste(const_names, collapse = ", ")))
     X <- X[, !const_cols, drop = FALSE]
@@ -535,7 +547,7 @@ validate_data <- function(X, y) {
 
   # Check for highly correlated columns
   if (ncol(X) > 1 && nrow(X) > 1) {
-    cor_mat <- tryCatch(cor(X), error = function(e) NULL)
+    cor_mat <- tryCatch(suppressWarnings(cor(X)), error = function(e) NULL)
     if (!is.null(cor_mat)) {
       diag(cor_mat) <- 0
       # Handle NaN from singular columns
@@ -638,7 +650,15 @@ smart_format <- function(x, sig_digits = 4) {
 #' @param target_name Target variable name
 #' @return Character string of equation
 build_equation <- function(intercept, main_effects, int_mat, var_names, target_name,
-                          scale = "original", mx = NULL) {
+                          scale = "original", mx = NULL, is_dummy = NULL) {
+  # Original-scale factor as used by the model: dummies enter interactions
+  # raw (0/1), continuous variables centered as (X - mean)
+  centered_factor <- function(v) {
+    if (!is.null(is_dummy) && isTRUE(is_dummy[v])) return(v)
+    m <- mx[[v]]
+    if (m < 0) sprintf("(%s + %s)", v, smart_format(abs(m))) else sprintf("(%s - %s)", v, smart_format(m))
+  }
+
   # For standardized scale, intercept is 0 (Y is centered), so don't display it
   # For original scale, always show intercept
   if (abs(intercept) < DISPLAY_THRESHOLD) {
@@ -683,18 +703,13 @@ build_equation <- function(intercept, main_effects, int_mat, var_names, target_n
       # Original scale: show (Xi - mean) form with actual mean values
       # Use smart_format to handle different data scales (e.g., 0.001 vs 1000)
       # Avoid double minus: (X - -2.5) → (X + 2.5)
-      m1 <- mx[v1]
       if (is_quadratic) {
-        if (m1 < 0) {
-          term <- sprintf("(%s + %s)²", v1, smart_format(abs(m1)))
-        } else {
-          term <- sprintf("(%s - %s)²", v1, smart_format(m1))
-        }
+        term <- paste0(centered_factor(v1), "²")
       } else {
-        m2 <- mx[v2]
-        part1 <- if (m1 < 0) sprintf("(%s + %s)", v1, smart_format(abs(m1))) else sprintf("(%s - %s)", v1, smart_format(m1))
-        part2 <- if (m2 < 0) sprintf("(%s + %s)", v2, smart_format(abs(m2))) else sprintf("(%s - %s)", v2, smart_format(m2))
-        term <- paste0(part1, part2)
+        f1 <- centered_factor(v1)
+        f2 <- centered_factor(v2)
+        # Join with "·" when a raw dummy name is involved, for readability
+        term <- if (identical(f1, v1) || identical(f2, v2)) paste0(f1, "·", f2) else paste0(f1, f2)
       }
     } else {
       # Standardized scale: X is already centered (mean=0), so just show X·X or X²
@@ -943,422 +958,304 @@ generate_sample_data <- function(
 }
 
 # ============================================================================
+# MODEL TERMS (design matrix)
+# ============================================================================
+# Every model term is a single numeric column computed directly from the
+# predictor matrix. Variables are referenced by column INDEX, never by name,
+# so arbitrary user column names (spaces, symbols, "x" next to "x_c", ...)
+# can never break a formula or collide with helper columns.
+#   main : X_i                      (not centered)
+#   int  : Z_i * Z_j                (Z = X - mean for continuous, raw 0/1 for dummies)
+#   quad : (X_i - mean_i)^2         (continuous variables only)
+
+#' Detect 0/1 dummy columns
+#' @param X Numeric matrix
+#' @return Named logical vector
+detect_dummies <- function(X) {
+  out <- vapply(seq_len(ncol(X)), function(i) {
+    vals <- unique(X[, i])
+    vals <- vals[!is.na(vals)]
+    length(vals) <= 2 && all(vals %in% c(0, 1))
+  }, logical(1))
+  names(out) <- colnames(X)
+  out
+}
+
+#' Enumerate candidate model terms
+#' Order matches the classic layout: main effects, then interactions (i-major),
+#' then quadratic terms.
+#' @param var_names Variable names (used for display labels only)
+#' @param is_dummy Logical vector: 0/1 dummy columns
+#' @param is_binary Logical vector: columns with <= 2 distinct values
+#'   (their square is collinear with the main effect, so no quadratic term)
+#' @param dummy_group Character vector: categorical group per variable (or NA)
+#' @param model_type "interaction" or "quadratic"
+#' @return data.frame(type, i, j, label)
+build_term_specs <- function(var_names, is_dummy, is_binary, dummy_group, model_type) {
+  p <- length(var_names)
+  main <- data.frame(type = rep("main", p), i = seq_len(p), j = seq_len(p),
+                     stringsAsFactors = FALSE)
+  int <- NULL
+  if (p >= 2) {
+    ii <- rep(seq_len(p - 1), (p - 1):1)
+    jj <- unlist(lapply(seq_len(p - 1), function(i) (i + 1):p))
+    # Dummies of the SAME categorical variable are mutually exclusive:
+    # their product is identically 0, so that interaction is skipped
+    same_grp <- !is.na(dummy_group[ii]) & !is.na(dummy_group[jj]) &
+      dummy_group[ii] == dummy_group[jj]
+    int <- data.frame(type = "int", i = ii[!same_grp], j = jj[!same_grp],
+                      stringsAsFactors = FALSE)
+  }
+  quad <- NULL
+  if (model_type == "quadratic") {
+    qi <- which(!is_binary)
+    quad <- data.frame(type = rep("quad", length(qi)), i = qi, j = qi,
+                       stringsAsFactors = FALSE)
+  }
+  specs <- rbind(main, int, quad)
+  specs$label <- ifelse(
+    specs$type == "main", var_names[specs$i],
+    ifelse(specs$type == "quad", paste0(var_names[specs$i], "²"),
+           paste0(var_names[specs$i], " × ", var_names[specs$j]))
+  )
+  rownames(specs) <- NULL
+  specs
+}
+
+#' Build the term (design) matrix, without intercept
+#' @param X Numeric matrix of predictors (n x p)
+#' @param specs Term specification from build_term_specs()
+#' @param mx Column means used for centering
+#' @param is_dummy Logical vector of dummy columns (not centered in interactions)
+#' @return n x nrow(specs) numeric matrix
+build_term_matrix <- function(X, specs, mx, is_dummy) {
+  Xc <- sweep(X, 2, mx, "-", check.margin = FALSE)
+  Z <- Xc
+  if (any(is_dummy)) Z[, is_dummy] <- X[, is_dummy]
+  M <- matrix(0, nrow(X), nrow(specs))
+  m <- specs$type == "main"
+  t <- specs$type == "int"
+  q <- specs$type == "quad"
+  if (any(m)) M[, m] <- X[, specs$i[m], drop = FALSE]
+  if (any(t)) M[, t] <- Z[, specs$i[t], drop = FALSE] * Z[, specs$j[t], drop = FALSE]
+  if (any(q)) M[, q] <- Xc[, specs$i[q], drop = FALSE]^2
+  M
+}
+
+# ============================================================================
 # STEPWISE VARIABLE SELECTION (逐次減増法)
 # ============================================================================
+# Partial F-tests are computed directly from a QR decomposition of the design
+# matrix. Results are identical to drop1(fit, test = "F") / add1(fit, test = "F")
+# (Type II SS, same rank tolerance 1e-7 as lm), but avoid re-parsing formulas
+# and refitting the model once per term.
 
-#' Get partial F-ratios using drop1() - Type II/III SS (順序非依存)
-#' @param fit lm object
-#' @return Named vector of partial F-ratios for each term
-get_drop1_f_ratios <- function(fit) {
-  tryCatch({
-    # drop1() gives partial F-test for each term (Type II SS)
-    # This tests "what happens if we remove this term, given all others"
-    drop_result <- drop1(fit, test = "F")
+QR_TOL <- 1e-7
 
-    # Extract F values (column name is "F value")
-    f_col <- grep("^F", names(drop_result), value = TRUE)
-    if (length(f_col) == 0) {
-      return(numeric(0))
-    }
+#' Partial F-ratios for removing each selected term (≡ drop1(test = "F"))
+#' @param M Full term matrix
+#' @param y Response
+#' @param sel Indices (columns of M) currently in the model
+#' @return Numeric vector of F-ratios aligned with sel (NA/NaN → 0)
+partial_f_drop <- function(M, y, sel) {
+  k <- length(sel)
+  Xd <- cbind(1, M[, sel, drop = FALSE])
+  q <- qr(Xd, tol = QR_TOL)
+  rss <- sum(qr.resid(q, y)^2)
+  rms <- rss / (length(y) - q$rank)
 
-    f_values <- drop_result[[f_col[1]]]
-    term_names <- rownames(drop_result)
-
-    # Remove <none> row (represents not dropping anything)
-    none_idx <- which(term_names == "<none>")
-    if (length(none_idx) > 0) {
-      f_values <- f_values[-none_idx]
-      term_names <- term_names[-none_idx]
-    }
-
-    # Handle NA values
-    f_values[is.na(f_values)] <- 0
-    names(f_values) <- term_names
-    f_values
-  }, error = function(e) {
-    numeric(0)
-  })
+  if (q$rank == k + 1) {
+    # Full rank: RSS increase from dropping term j = b_j^2 / [(X'X)^-1]_jj
+    R <- qr.R(q)
+    Rinv <- backsolve(R, diag(k + 1))
+    b_piv <- backsolve(R, qr.qty(q, y)[seq_len(k + 1)])
+    dev <- numeric(k + 1)
+    dev[q$pivot] <- b_piv^2 / rowSums(Rinv^2)
+    dev <- dev[-1]
+  } else {
+    # Rank deficient: refit without each term (dropping an aliased term → NA)
+    dev <- vapply(seq_len(k), function(t) {
+      q2 <- qr(Xd[, -(t + 1), drop = FALSE], tol = QR_TOL)
+      d_rank <- q$rank - q2$rank
+      if (d_rank < 1e-4) return(NA_real_)
+      (sum(qr.resid(q2, y)^2) - rss) / d_rank
+    }, numeric(1))
+  }
+  f <- dev / rms
+  f[is.na(f)] <- 0
+  f
 }
 
-#' Get partial F-ratios for candidate terms using add1()
-#' @param fit Current lm object
-#' @param candidates Character vector of candidate terms to test
-#' @param data Data frame for fitting
-#' @return Named vector of partial F-ratios for each candidate
-get_add1_f_ratios <- function(fit, candidates, data) {
-  tryCatch({
-    # Build scope formula with all candidates
-    scope_formula <- as.formula(paste("~ . +", paste(candidates, collapse = " + ")))
-
-    # add1() gives partial F-test for each candidate term
-    # This tests "what happens if we add this term, given current model"
-    add_result <- add1(fit, scope = scope_formula, test = "F", data = data)
-
-    # Extract F values
-    f_col <- grep("^F", names(add_result), value = TRUE)
-    if (length(f_col) == 0) {
-      return(numeric(0))
-    }
-
-    f_values <- add_result[[f_col[1]]]
-    term_names <- rownames(add_result)
-
-    # Remove <none> row
-    none_idx <- which(term_names == "<none>")
-    if (length(none_idx) > 0) {
-      f_values <- f_values[-none_idx]
-      term_names <- term_names[-none_idx]
-    }
-
-    # Handle NA values
-    f_values[is.na(f_values)] <- 0
-    names(f_values) <- term_names
-    f_values
-  }, error = function(e) {
-    numeric(0)
-  })
-}
-
-#' Build interaction term name, respecting dummy variable rules
-#' Dummy variables use original name; continuous variables use centered (_c) name
-#' @param v1 Variable 1 name
-#' @param v2 Variable 2 name
-#' @param is_dummy Named logical vector indicating which variables are dummies
-#' @return Formula term string, e.g., "I(X1_c * Color_B)"
-make_interaction_term <- function(v1, v2, is_dummy) {
-  t1 <- if (is_dummy[v1]) v1 else paste0(v1, "_c")
-  t2 <- if (is_dummy[v2]) v2 else paste0(v2, "_c")
-  sprintf("I(%s * %s)", t1, t2)
-}
-
-#' Check if a main effect is required by hierarchy (has dependent higher-order terms)
-#' Uses pattern matching to detect any interaction or quadratic term containing
-#' the variable, regardless of whether it was centered or not.
-#' @param main_var The main effect variable name
-#' @param selected_terms Currently selected terms
-#' @param var_names All variable names
-#' @return TRUE if this main effect cannot be removed due to hierarchy
-is_required_by_hierarchy <- function(main_var, selected_terms, var_names) {
-  # Check if any quadratic term depends on this variable
-  quad_term <- sprintf("I(%s_c^2)", main_var)
-  if (quad_term %in% selected_terms) {
-    return(TRUE)
-  }
-
-  # Check if any interaction term in selected_terms contains this variable
-  # Matches both centered (var_c) and original (var) forms
-  # Pattern: I(... * ...) where either side contains this variable
-  esc_var <- gsub("([.+?^${}()|\\[\\]\\\\])", "\\\\\\1", main_var)
-  pattern <- sprintf("^I\\((%s_c|%s) \\* |\\* (%s_c|%s)\\)$", esc_var, esc_var, esc_var, esc_var)
-  if (any(grepl(pattern, selected_terms))) {
-    return(TRUE)
-  }
-
-  return(FALSE)
-}
-
-#' Match term name to F-ratio names (handles I() wrapper and : notation)
-#' @param term Term name from formula (e.g., "I(X1 * X2)")
-#' @param f_ratio_names Names from drop1/add1 result
-#' @return Matched name or NA if not found
-match_term_to_f_name <- function(term, f_ratio_names) {
-  # Try exact match first
-  if (term %in% f_ratio_names) {
-    return(term)
-  }
-  # Try without I() wrapper
-  clean_term <- gsub("^I\\((.*)\\)$", "\\1", term)
-  if (clean_term %in% f_ratio_names) {
-    return(clean_term)
-  }
-  # Try converting * to : (R's interaction notation)
-  colon_term <- gsub(" \\* ", ":", clean_term)
-  if (colon_term %in% f_ratio_names) {
-    return(colon_term)
-  }
-  return(NA_character_)
+#' Partial F-ratios for adding each candidate term (≡ add1(test = "F"))
+#' @param M Full term matrix
+#' @param y Response
+#' @param sel Indices currently in the model
+#' @param cand Candidate indices
+#' @return Numeric vector of F-ratios aligned with cand (aliased/NA → 0)
+partial_f_add <- function(M, y, sel, cand) {
+  q <- qr(cbind(1, M[, sel, drop = FALSE]), tol = QR_TOL)
+  e <- qr.resid(q, y)
+  rss0 <- sum(e^2)
+  rdf <- length(y) - q$rank
+  C <- M[, cand, drop = FALSE]
+  Rc <- qr.resid(q, C)
+  rr <- colSums(Rc^2)
+  # Same aliasing rule as lm's QR: residual norm < tol * original norm
+  aliased <- sqrt(rr) < QR_TOL * sqrt(colSums(C^2))
+  dev <- colSums(Rc * e)^2 / rr
+  f <- dev / ((rss0 - dev) / (rdf - 1))
+  f[aliased | is.na(f)] <- 0
+  f
 }
 
 #' Perform stepwise variable selection (逐次減増法)
-#' Uses drop1()/add1() for partial F-tests (Type II SS - 順序非依存)
-#' Optionally enforces hierarchy during selection
-#' @param df Data frame with predictors and response Y
-#' @param all_terms All possible terms (main, interaction, quadratic)
-#' @param var_names Original variable names (for hierarchy)
+#' Starts from the full model; each iteration removes the weakest term
+#' (F <= f_out) and then adds back removed terms while F > f_in.
+#' Optionally enforces the hierarchy principle.
+#' @param M Full term matrix (n x T)
+#' @param y Response vector
+#' @param specs Term specifications (nrow = T)
 #' @param model_type "interaction" or "quadratic"
-#' @param f_in F-ratio threshold for entry (default 2)
-#' @param f_out F-ratio threshold for removal (default 2)
-#' @param enforce_hierarchy Whether to enforce hierarchy principle (default TRUE)
-#' @param max_iter Maximum iterations (default 100)
-#' @return List with selected terms and selection history
+#' @param f_in F-ratio threshold for entry
+#' @param f_out F-ratio threshold for removal
+#' @param enforce_hierarchy Whether to enforce hierarchy principle
+#' @param max_iter Safety cap on iterations (oscillation detection also stops the loop)
+#' @return List with selected (term indices), removed, history, n_iterations
 stepwise_selection <- function(
-    df,
-    all_terms,
-    var_names,
+    M, y, specs,
     model_type = "quadratic",
     f_in = 2,
     f_out = 2,
     enforce_hierarchy = TRUE,
-    max_iter = 100
+    max_iter = max(100, 3 * nrow(specs))
 ) {
-  # Start with full model (all terms selected)
-  selected_terms <- all_terms
-  removed_terms <- character(0)
+  n_terms <- nrow(specs)
+  labels <- specs$label
+  is_main <- specs$type == "main"
+  # Main-effect term index for each variable (main terms are rows 1..p)
+  main_of <- function(v) v
+
+  selected <- seq_len(n_terms)
+  removed <- integer(0)
   history <- list()
   iteration <- 0
+  state_history <- new.env(hash = TRUE, parent = emptyenv())
 
-  # Track previous states to detect oscillation
-  state_history <- character(0)
+  add_history <- function(action, term, f) {
+    history[[length(history) + 1]] <<- list(
+      iteration = iteration, action = action, term = labels[term], f_ratio = f
+    )
+  }
 
-  message("=== 逐次減増法 開始 (部分F検定使用) ===")
-  message(sprintf("初期モデル: %d 項", length(selected_terms)))
+  # A main effect is required if any selected higher-order term contains it
+  is_required <- function(v, sel) {
+    hi <- sel[!is_main[sel]]
+    any(specs$i[hi] == v | specs$j[hi] == v)
+  }
+
+  message(sprintf("=== 逐次減増法 開始 (部分F検定使用): %d 項 ===", n_terms))
 
   while (iteration < max_iter) {
     iteration <- iteration + 1
     changed <- FALSE
 
-    # Check for oscillation (same state seen before)
-    current_state <- paste(sort(selected_terms), collapse = ",")
-    if (current_state %in% state_history) {
+    # Oscillation detection (same term set seen before)
+    state <- paste(sort(selected), collapse = ",")
+    if (!is.null(state_history[[state]])) {
       message(sprintf("  振動検出 - 終了 (反復 %d 回)", iteration))
       break
     }
-    state_history <- c(state_history, current_state)
+    state_history[[state]] <- TRUE
 
-    # --- BACKWARD STEP (後退ステップ) using drop1() ---
-    if (length(selected_terms) > 1) {  # Need at least 1 term to drop
-      # Fit current model
-      formula_str <- paste("Y ~", paste(selected_terms, collapse = " + "))
-      fit <- tryCatch(
-        lm(as.formula(formula_str), data = df),
-        error = function(e) NULL
-      )
-
-      if (!is.null(fit)) {
-        # Get partial F-ratios using drop1() (Type II SS)
-        f_ratios <- get_drop1_f_ratios(fit)
-
-        if (length(f_ratios) > 0) {
-          # Match term names using helper function
-          matched_f <- sapply(selected_terms, function(term) {
-            matched_name <- match_term_to_f_name(term, names(f_ratios))
-            if (!is.na(matched_name)) f_ratios[matched_name] else Inf
-          })
-          names(matched_f) <- selected_terms
-
-          # Find terms eligible for removal (F <= f_out)
-          # BUT: check hierarchy - don't remove main effects needed by higher-order terms
-          eligible_for_removal <- matched_f[matched_f <= f_out]
-
-          if (length(eligible_for_removal) > 0) {
-            # Sort by F-ratio (ascending) and try to remove
-            sorted_candidates <- names(sort(eligible_for_removal))
-
-            for (candidate in sorted_candidates) {
-              # Check if this is a main effect required by hierarchy
-              if (enforce_hierarchy && candidate %in% var_names) {
-                if (is_required_by_hierarchy(candidate, selected_terms, var_names)) {
-                  message(sprintf("  [%d] スキップ: %s (階層原則により削除不可, F=%.3f)",
-                                iteration, candidate, eligible_for_removal[candidate]))
-                  next
-                }
-              }
-
-              # Can remove this term
-              selected_terms <- setdiff(selected_terms, candidate)
-              removed_terms <- c(removed_terms, candidate)
-              changed <- TRUE
-
-              message(sprintf("  [%d] 削除: %s (部分F=%.3f)",
-                            iteration, candidate, eligible_for_removal[candidate]))
-
-              history[[length(history) + 1]] <- list(
-                iteration = iteration,
-                action = "remove",
-                term = candidate,
-                f_ratio = eligible_for_removal[candidate]
-              )
-              break  # Remove one term per backward step
-            }
+    # --- BACKWARD STEP: remove the weakest removable term ---
+    if (length(selected) > 1) {
+      f <- partial_f_drop(M, y, selected)
+      elig <- which(f <= f_out)
+      if (length(elig) > 0) {
+        # Stable ascending order of F (ties keep model order)
+        elig <- elig[order(f[elig], method = "radix")]
+        for (e in elig) {
+          term <- selected[e]
+          if (enforce_hierarchy && is_main[term] && is_required(specs$i[term], selected)) {
+            next
           }
-        }
-      }
-    }
-
-    # --- FORWARD STEP (前進ステップ) using add1() ---
-    # Only from iteration 2 onwards
-    # Keep adding terms while any removed term has F > f_in
-    if (iteration >= 2 && length(removed_terms) > 0 && length(selected_terms) > 0) {
-      forward_continue <- TRUE
-
-      while (forward_continue && length(removed_terms) > 0) {
-        # Fit current model
-        formula_str <- paste("Y ~", paste(selected_terms, collapse = " + "))
-        fit <- tryCatch(
-          lm(as.formula(formula_str), data = df),
-          error = function(e) NULL
-        )
-
-        if (is.null(fit)) {
-          forward_continue <- FALSE
-          next
-        }
-
-        # Get partial F-ratios for candidates using add1()
-        f_ratios_add <- get_add1_f_ratios(fit, removed_terms, df)
-
-        if (length(f_ratios_add) == 0) {
-          forward_continue <- FALSE
-          next
-        }
-
-        # Match term names using helper function
-        matched_f <- sapply(removed_terms, function(term) {
-          matched_name <- match_term_to_f_name(term, names(f_ratios_add))
-          if (!is.na(matched_name)) f_ratios_add[matched_name] else 0
-        })
-        names(matched_f) <- removed_terms
-
-        # Find best term to add (F > f_in)
-        eligible_for_add <- matched_f[matched_f > f_in]
-
-        if (length(eligible_for_add) > 0) {
-          # Add the term with highest F-ratio
-          best_term <- names(which.max(eligible_for_add))
-          best_f <- eligible_for_add[best_term]
-
-          # Check hierarchy: if adding interaction/quadratic, ensure main effects are present
-          terms_to_add <- best_term
-          hierarchy_additions <- character(0)
-
-          if (enforce_hierarchy) {
-            # Check if this is an interaction term
-            if (grepl("^I\\(.*\\*.*\\)$", best_term)) {
-              # Extract variable names from interaction (e.g., "I(X1_c * Color_B)" -> ["X1_c", "Color_B"])
-              inner <- gsub("^I\\((.*)\\)$", "\\1", best_term)
-              vars <- trimws(strsplit(inner, "\\*")[[1]])
-              for (v in vars) {
-                # Map to original variable name:
-                # If the part is directly in var_names, use as-is (e.g., dummy "Color_B")
-                # Otherwise strip _c suffix (e.g., "X1_c" → "X1")
-                base_v <- if (v %in% var_names) v else sub("_c$", "", v)
-                if (!(base_v %in% selected_terms) && !(base_v %in% terms_to_add)) {
-                  if (base_v %in% removed_terms) {
-                    hierarchy_additions <- c(hierarchy_additions, base_v)
-                  }
-                }
-              }
-            }
-
-            # Check if this is a quadratic term
-            if (grepl("^I\\(.*\\^2\\)$", best_term)) {
-              inner <- gsub("^I\\((.*)\\^2\\)$", "\\1", best_term)
-              base_v <- if (inner %in% var_names) inner else sub("_c$", "", inner)
-              if (!(base_v %in% selected_terms) && !(base_v %in% terms_to_add)) {
-                if (base_v %in% removed_terms) {
-                  hierarchy_additions <- c(hierarchy_additions, base_v)
-                }
-              }
-            }
-          }
-
-          # Add all terms (best term + hierarchy requirements if enabled)
-          all_to_add <- c(terms_to_add, hierarchy_additions)
-          selected_terms <- c(selected_terms, all_to_add)
-          removed_terms <- setdiff(removed_terms, all_to_add)
+          selected <- selected[-e]
+          removed <- c(removed, term)
           changed <- TRUE
-
-          message(sprintf("  [%d] 追加: %s (部分F=%.3f)",
-                        iteration, best_term, best_f))
-
-          history[[length(history) + 1]] <- list(
-            iteration = iteration,
-            action = "add",
-            term = best_term,
-            f_ratio = best_f
-          )
-
-          # Log hierarchy additions
-          for (h_term in hierarchy_additions) {
-            message(sprintf("  [%d] 階層追加: %s (%s のため)",
-                          iteration, h_term, best_term))
-            history[[length(history) + 1]] <- list(
-              iteration = iteration,
-              action = "hierarchy_add",
-              term = h_term,
-              f_ratio = NA
-            )
-          }
-        } else {
-          # No more terms to add
-          forward_continue <- FALSE
+          message(sprintf("  [%d] 削除: %s (部分F=%.3f)", iteration, labels[term], f[e]))
+          add_history("remove", term, f[e])
+          break
         }
       }
     }
 
-    # Check convergence
+    # --- FORWARD STEP: re-add removed terms while F > f_in ---
+    if (iteration >= 2 && length(removed) > 0 && length(selected) > 0) {
+      repeat {
+        if (length(removed) == 0) break
+        f <- partial_f_add(M, y, selected, removed)
+        if (!any(f > f_in)) break
+        best_pos <- which.max(ifelse(f > f_in, f, -Inf))
+        best <- removed[best_pos]
+        best_f <- f[best_pos]
+
+        # Hierarchy: bring back main effects needed by the added term
+        additions <- integer(0)
+        if (enforce_hierarchy && !is_main[best]) {
+          for (v in unique(c(specs$i[best], specs$j[best]))) {
+            mt <- main_of(v)
+            if (!(mt %in% selected) && mt %in% removed) additions <- c(additions, mt)
+          }
+        }
+
+        to_add <- c(best, additions)
+        selected <- c(selected, to_add)
+        removed <- setdiff(removed, to_add)
+        changed <- TRUE
+        message(sprintf("  [%d] 追加: %s (部分F=%.3f)", iteration, labels[best], best_f))
+        add_history("add", best, best_f)
+        for (h in additions) add_history("hierarchy_add", h, NA_real_)
+      }
+    }
+
     if (!changed) {
       message(sprintf("  収束 (反復 %d 回)", iteration))
       break
     }
   }
 
-  # Final hierarchy check (safety net, only if enforce_hierarchy is TRUE)
-  # Note: Quadratic terms use centered names (_c suffix)
-  hierarchy_added <- FALSE
+  # Final hierarchy check (safety net)
   if (enforce_hierarchy) {
     if (model_type == "quadratic") {
-      for (var in var_names) {
-        quad_term <- sprintf("I(%s_c^2)", var)
-        if (quad_term %in% selected_terms && !(var %in% selected_terms)) {
-          selected_terms <- c(var, selected_terms)
-          removed_terms <- setdiff(removed_terms, var)
-          message(sprintf("  [最終階層] 強制追加: %s (2次項 %s が選択されたため)", var, quad_term))
-          hierarchy_added <- TRUE
-
+      for (term in which(specs$type == "quad")) {
+        mt <- main_of(specs$i[term])
+        if (term %in% selected && !(mt %in% selected)) {
+          selected <- c(mt, selected)
+          removed <- setdiff(removed, mt)
           history[[length(history) + 1]] <- list(
-            iteration = iteration + 1,
-            action = "hierarchy_final",
-            term = var,
-            f_ratio = NA
+            iteration = iteration + 1, action = "hierarchy_final",
+            term = labels[mt], f_ratio = NA_real_
           )
         }
       }
     }
-
-    # Check all interaction terms in selected_terms:
-    # Extract variable names from I(... * ...) patterns and ensure their main effects are present
-    int_selected <- grep("^I\\(.*\\*.*\\)$", selected_terms, value = TRUE)
-    for (int_term in int_selected) {
-      # Extract the two operands from "I(A * B)"
-      inner <- gsub("^I\\((.*)\\)$", "\\1", int_term)
-      parts <- trimws(strsplit(inner, "\\*")[[1]])
-      # Map back to original variable names:
-      # If part is directly in var_names, use as-is (dummy variable)
-      # Otherwise strip _c suffix (centered continuous variable)
-      for (part in parts) {
-        orig_var <- if (part %in% var_names) part else sub("_c$", "", part)
-        if (orig_var %in% var_names && !(orig_var %in% selected_terms)) {
-          selected_terms <- c(orig_var, selected_terms)
-          removed_terms <- setdiff(removed_terms, orig_var)
-          message(sprintf("  [最終階層] 強制追加: %s (交互作用 %s が選択されたため)", orig_var, int_term))
-          hierarchy_added <- TRUE
+    for (term in selected[specs$type[selected] == "int"]) {
+      for (v in c(specs$i[term], specs$j[term])) {
+        mt <- main_of(v)
+        if (!(mt %in% selected)) {
+          selected <- c(mt, selected)
+          removed <- setdiff(removed, mt)
+          message(sprintf("  [最終階層] 強制追加: %s", labels[mt]))
         }
       }
     }
-
-    # If hierarchy was enforced at the end, just log it
-    # (coefficients will be correctly calculated in run_rsm_analysis)
-    if (hierarchy_added) {
-      message("  [最終階層] 階層原則により主効果を追加")
-    }
   }
 
-  message(sprintf("=== 逐次減増法 終了: %d 項選択 ===", length(selected_terms)))
+  message(sprintf("=== 逐次減増法 終了: %d 項選択 ===", length(selected)))
 
   list(
-    selected_terms = selected_terms,
-    removed_terms = removed_terms,
+    selected = selected,
+    removed = removed,
     history = history,
     n_iterations = iteration
   )
@@ -1368,6 +1265,39 @@ stepwise_selection <- function(
 # RSM ANALYSIS WRAPPER
 # ============================================================================
 
+#' Build a fast prediction function from a fitted model
+#' Numerically identical to predict(fit, se.fit = TRUE), but works directly
+#' on a numeric matrix of predictors (no model.frame / formula overhead).
+#' @param fit lm object fitted on the term columns
+#' @param specs Specs of the terms in the model (same order as the fit)
+#' @param mx Training column means
+#' @param is_dummy Dummy flags
+#' @param var_names Variable names (column order of the input)
+#' @return function(newX) -> list(mean, se, residual_se)
+make_rsm_predictor <- function(fit, specs, mx, is_dummy, var_names) {
+  b <- coef(fit)
+  r <- fit$rank
+  piv <- fit$qr$pivot[seq_len(r)]
+  b_piv <- b[piv]
+  R <- fit$qr$qr[seq_len(r), seq_len(r), drop = FALSE]
+  R[lower.tri(R)] <- 0
+  Rinv <- backsolve(R, diag(r))
+  rdf <- fit$df.residual
+  sigma <- if (rdf > 0) sqrt(sum(fit$residuals^2) / rdf) else NaN
+
+  function(newX) {
+    if (!is.matrix(newX)) newX <- as.matrix(newX)
+    if (!is.null(colnames(newX))) newX <- newX[, var_names, drop = FALSE]
+    storage.mode(newX) <- "double"
+    D <- cbind(1, build_term_matrix(newX, specs, mx, is_dummy))[, piv, drop = FALSE]
+    list(
+      mean = drop(D %*% b_piv),
+      se = sqrt(rowSums((D %*% Rinv)^2)) * sigma,
+      residual_se = sigma
+    )
+  }
+}
+
 #' Perform RSM (Response Surface Methodology) analysis with stepwise selection
 #' @param X Predictor matrix
 #' @param y Response vector
@@ -1376,8 +1306,8 @@ stepwise_selection <- function(
 #' @param f_in F-ratio threshold for entry (default 2)
 #' @param f_out F-ratio threshold for removal (default 2)
 #' @param enforce_hierarchy Whether to enforce hierarchy principle (default TRUE)
-#' @return List with fit and extracted results
-#' @throws Error if analysis fails
+#' @param categorical_mapping Mapping from encode_categorical()
+#' @return List with fit, predictor and extracted results
 run_rsm_analysis <- function(
     X, y,
     model_type = "quadratic",
@@ -1387,8 +1317,9 @@ run_rsm_analysis <- function(
     enforce_hierarchy = TRUE,
     categorical_mapping = NULL
 ) {
-  # Input validation
   if (!is.matrix(X)) X <- as.matrix(X)
+  storage.mode(X) <- "double"
+  y <- as.numeric(y)
 
   var_names <- colnames(X)
   p <- ncol(X)
@@ -1398,230 +1329,101 @@ run_rsm_analysis <- function(
     stop(sprintf("サンプル数(%d)が変数数(%d)に対して不足しています", n, p))
   }
 
-  # Compute scaling info
-  mx <- colMeans(X, na.rm = TRUE)
-  sx <- apply(X, 2, sd, na.rm = TRUE)
-  sx[sx < .Machine$double.eps] <- 1  # Avoid division by zero
+  # Scaling info
+  mx <- colMeans(X)
+  sx <- apply(X, 2, sd)
+  sx[!is.finite(sx) | sx < .Machine$double.eps] <- 1
+  my <- mean(y)
+  sy <- sd(y)
+  if (!is.finite(sy) || sy < .Machine$double.eps) sy <- 1
 
-  # Compute Y scaling info
-  my <- mean(y, na.rm = TRUE)
-  sy <- sd(y, na.rm = TRUE)
-  if (is.na(sy) || sy < .Machine$double.eps) sy <- 1  # Avoid division by zero
+  X_scaled <- sweep(sweep(X, 2, mx, "-"), 2, sx, "/")
+  y_scaled <- (y - my) / sy
 
-  # Center and scale X for standardized coefficients
-  X_centered <- sweep(X, 2, mx, "-")
-  X_scaled <- sweep(X_centered, 2, sx, "/")
-
-  # Create data frame for model fitting
-  df_orig <- as.data.frame(X)
-  df_orig$Y <- y
-
-  # Add centered columns for quadratic terms (Xi_c = Xi - mean(Xi))
-  # Main effects use original Xi, but interactions and quadratics use centered Xi_c
-  centered_names <- paste0(var_names, "_c")
-  for (i in seq_along(var_names)) {
-    df_orig[[centered_names[i]]] <- X[, i] - mx[i]
-  }
-
-  # Full standardization: (Y - mean(Y)) / sd(Y)
-  df_scaled <- as.data.frame(X_scaled)
-  df_scaled$Y <- (y - my) / sy
-
-  # Add centered columns for scaled data (already centered, so just copy)
-  for (i in seq_along(var_names)) {
-    df_scaled[[centered_names[i]]] <- X_centered[, i] / sx[i]
-  }
-
-  # ---------------------------------------------------------------------------
-  # Detect dummy variables and categorical groups
-  # Dummy: binary 0/1 → D² = D, so quadratic term is collinear with main effect
-  # Same-category dummies: mutually exclusive → their product is always 0
-  # ---------------------------------------------------------------------------
-  is_dummy <- sapply(var_names, function(v) {
-    vals <- unique(X[, v])
-    vals <- vals[!is.na(vals)]
-    length(vals) <= 2 && all(vals %in% c(0, 1))
-  })
-
-  # Build a lookup: variable name → original categorical group name (or NA)
+  # Dummy detection and categorical groups
+  is_dummy <- detect_dummies(X)
+  is_binary <- apply(X, 2, function(col) length(unique(col)) <= 2)
   dummy_group <- rep(NA_character_, p)
   names(dummy_group) <- var_names
-  if (!is.null(categorical_mapping)) {
-    for (cat_name in names(categorical_mapping)) {
-      for (dv in categorical_mapping[[cat_name]]$dummy_cols) {
-        if (dv %in% var_names) {
-          dummy_group[dv] <- cat_name
-        }
-      }
-    }
+  for (cat_name in names(categorical_mapping)) {
+    dv <- intersect(categorical_mapping[[cat_name]]$dummy_cols, var_names)
+    dummy_group[dv] <- cat_name
   }
 
-  # Build all possible terms based on model type
-  # First order terms (use original Xi - NOT centered)
-  fo_terms <- var_names
+  specs <- build_term_specs(var_names, is_dummy, is_binary, dummy_group, model_type)
+  M <- build_term_matrix(X, specs, mx, is_dummy)
 
-  # Interaction terms:
-  #   continuous × continuous → (Xi_c * Xj_c)  [both centered]
-  #   continuous × dummy      → (Xi_c * Dj)    [only continuous centered]
-  #   dummy × dummy (diff cat) → (Di * Dj)     [neither centered]
-  # SKIP interactions between dummies from the SAME categorical variable
-  # (mutually exclusive → product is always 0 → zero-variance column)
-  int_terms <- character(0)
-  if (p >= 2) {
-    for (i in 1:(p-1)) {
-      for (j in (i+1):p) {
-        # Check if both belong to the same categorical group
-        gi <- dummy_group[var_names[i]]
-        gj <- dummy_group[var_names[j]]
-        if (!is.na(gi) && !is.na(gj) && gi == gj) {
-          next  # Skip: same category → mutually exclusive → product always 0
-        }
-        int_terms <- c(int_terms, make_interaction_term(var_names[i], var_names[j], is_dummy))
-      }
-    }
-  }
-
-  # Quadratic terms: (Xi - X̄i)² — continuous variables only
-  # SKIP for dummy variables: D ∈ {0,1} → D² = D → perfectly collinear with main effect
-  quad_terms <- character(0)
-  if (model_type == "quadratic") {
-    for (i in seq_len(p)) {
-      if (!is_dummy[var_names[i]]) {
-        quad_terms <- c(quad_terms, sprintf("I(%s_c^2)", var_names[i]))
-      }
-    }
-  }
-
-  # Combine all terms
-  all_terms <- c(fo_terms, int_terms, quad_terms)
-
-  # Apply stepwise selection if enabled
   if (use_stepwise) {
-    stepwise_result <- stepwise_selection(
-      df = df_orig,
-      all_terms = all_terms,
-      var_names = var_names,
+    sw <- stepwise_selection(
+      M, y, specs,
       model_type = model_type,
-      f_in = f_in,
-      f_out = f_out,
+      f_in = f_in, f_out = f_out,
       enforce_hierarchy = enforce_hierarchy
     )
-    selected_terms <- stepwise_result$selected_terms
-    selection_history <- stepwise_result$history
+    sel <- sw$selected
+    selection_history <- sw$history
   } else {
-    selected_terms <- all_terms
+    sel <- seq_len(nrow(specs))
     selection_history <- list()
   }
 
-  # Build final formula with selected terms
-  if (length(selected_terms) == 0) {
-    # If no terms selected, use intercept only model
-    formula_str <- "Y ~ 1"
-  } else {
-    formula_str <- paste("Y ~", paste(selected_terms, collapse = " + "))
-  }
-  model_formula <- as.formula(formula_str)
-
-  # Fit model on original scale
+  # Final fit on the selected term columns (columns named T<index>)
+  term_ids <- paste0("T", sel)
+  df_fit <- as.data.frame(M[, sel, drop = FALSE])
+  names(df_fit) <- term_ids
+  df_fit$Y <- y
+  model_formula <- as.formula(
+    if (length(sel) == 0) "Y ~ 1" else paste("Y ~", paste(term_ids, collapse = " + "))
+  )
   fit_orig <- tryCatch(
-    lm(model_formula, data = df_orig),
-    error = function(e) {
-      stop(sprintf("モデルフィッティング失敗: %s", e$message))
-    }
+    lm(model_formula, data = df_fit),
+    error = function(e) stop(sprintf("モデルフィッティング失敗: %s", e$message))
   )
 
-  # Fit model on scaled data for standardized coefficients
-  fit_scaled <- tryCatch(
-    lm(model_formula, data = df_scaled),
-    error = function(e) {
-      stop(sprintf("標準化モデルフィッティング失敗: %s", e$message))
-    }
-  )
+  # Standardized coefficients: same terms on fully standardized X and Y
+  Ms <- build_term_matrix(X_scaled, specs[sel, , drop = FALSE], rep(0, p), is_dummy)
+  qs <- qr(cbind(1, Ms), tol = QR_TOL)
+  coef_scaled <- qr.coef(qs, y_scaled)
 
-  # Extract coefficients
   coef_orig <- coef(fit_orig)
-  coef_scaled <- coef(fit_scaled)
-
-  # Intercept
-  intercept_orig <- coef_orig["(Intercept)"]
+  intercept_orig <- unname(coef_orig[1])
   if (is.na(intercept_orig)) intercept_orig <- 0
-  intercept_std <- 0  # Standardized model has intercept 0 by design
+  intercept_std <- unname(coef_scaled[1])
+  if (is.na(intercept_std)) intercept_std <- 0
 
-  # Main effects (only for selected terms)
-  main_effects_orig <- rep(0, p)
-  names(main_effects_orig) <- var_names
-  main_effects_std <- rep(0, p)
-  names(main_effects_std) <- var_names
+  b_orig <- unname(coef_orig[-1])
+  b_std <- unname(coef_scaled[-1])
+  b_orig[is.na(b_orig)] <- 0
+  b_std[is.na(b_std)] <- 0
 
-  for (var in var_names) {
-    if (var %in% selected_terms && var %in% names(coef_orig)) {
-      main_effects_orig[var] <- coef_orig[var]
-      if (var %in% names(coef_scaled)) {
-        main_effects_std[var] <- coef_scaled[var]
-      }
-    }
-  }
-  main_effects_orig[is.na(main_effects_orig)] <- 0
-  main_effects_std[is.na(main_effects_std)] <- 0
+  sel_specs <- specs[sel, , drop = FALSE]
+  main_effects_orig <- setNames(rep(0, p), var_names)
+  main_effects_std <- main_effects_orig
+  interaction_matrix_orig <- matrix(0, p, p, dimnames = list(var_names, var_names))
+  interaction_matrix_std <- interaction_matrix_orig
 
-  # Build interaction matrix
-  interaction_matrix_orig <- matrix(0, nrow = p, ncol = p)
-  rownames(interaction_matrix_orig) <- var_names
-  colnames(interaction_matrix_orig) <- var_names
-
-  interaction_matrix_std <- matrix(0, nrow = p, ncol = p)
-  rownames(interaction_matrix_std) <- var_names
-  colnames(interaction_matrix_std) <- var_names
-
-  # Fill interaction terms (only for selected terms)
-  # Term names built by make_interaction_term: continuous uses _c, dummy uses original
-  if (p >= 2) {
-    for (i in 1:(p-1)) {
-      for (j in (i+1):p) {
-        term_name <- make_interaction_term(var_names[i], var_names[j], is_dummy)
-        if (term_name %in% selected_terms && term_name %in% names(coef_orig)) {
-          val_orig <- coef_orig[term_name]
-          val_std <- coef_scaled[term_name]
-          if (!is.na(val_orig)) {
-            interaction_matrix_orig[i, j] <- val_orig
-            interaction_matrix_orig[j, i] <- val_orig
-          }
-          if (!is.na(val_std)) {
-            interaction_matrix_std[i, j] <- val_std
-            interaction_matrix_std[j, i] <- val_std
-          }
-        }
-      }
-    }
+  m <- sel_specs$type == "main"
+  main_effects_orig[sel_specs$i[m]] <- b_orig[m]
+  main_effects_std[sel_specs$i[m]] <- b_std[m]
+  h <- !m
+  if (any(h)) {
+    idx <- cbind(sel_specs$i[h], sel_specs$j[h])
+    interaction_matrix_orig[idx] <- b_orig[h]
+    interaction_matrix_orig[idx[, 2:1, drop = FALSE]] <- b_orig[h]
+    interaction_matrix_std[idx] <- b_std[h]
+    interaction_matrix_std[idx[, 2:1, drop = FALSE]] <- b_std[h]
   }
 
-  # Fill quadratic terms (on diagonal, only for selected terms)
-  # Note: Uses centered term names (_c suffix)
-  if (model_type == "quadratic") {
-    for (i in 1:p) {
-      term_name <- sprintf("I(%s_c^2)", var_names[i])
-      if (term_name %in% selected_terms && term_name %in% names(coef_orig)) {
-        val_orig <- coef_orig[term_name]
-        val_std <- coef_scaled[term_name]
-        if (!is.na(val_orig)) {
-          interaction_matrix_orig[i, i] <- val_orig
-        }
-        if (!is.na(val_std)) {
-          interaction_matrix_std[i, i] <- val_std
-        }
-      }
-    }
-  }
-
-  # Compute predictions
-  predictions <- predict(fit_orig, newdata = df_orig)
-
-  # Model summary for diagnostics
+  predictions <- unname(fitted(fit_orig))
   model_summary <- summary(fit_orig)
+  coef_table <- model_summary$coefficients
+  rn <- rownames(coef_table)
+  lab <- c(`(Intercept)` = "(Intercept)", setNames(sel_specs$label, term_ids))
+  rownames(coef_table) <- unname(lab[rn])
 
   list(
     fit = fit_orig,
-    fit_scaled = fit_scaled,
+    predictor = make_rsm_predictor(fit_orig, sel_specs, mx, is_dummy, var_names),
     model_summary = model_summary,
     # Standardized coefficients
     main_effects_std = main_effects_std,
@@ -1636,20 +1438,22 @@ run_rsm_analysis <- function(
     sx = sx,
     my = my,
     sy = sy,
+    is_dummy = is_dummy,
     # Legacy/fallback fields (used with %||% operator throughout UI code)
     main_effects = main_effects_std,
     interaction_matrix = interaction_matrix_std,
     intercept = intercept_orig,
-    # Predictions (original scale)
-    predictions = as.vector(predictions),
-    # RSM specific
+    predictions = predictions,
     r_squared = model_summary$r.squared,
     adj_r_squared = model_summary$adj.r.squared,
     f_statistic = model_summary$fstatistic,
-    coefficients_table = model_summary$coefficients,
+    coefficients_table = coef_table,
+    n_params = fit_orig$rank - 1,
     # Stepwise selection info
-    selected_terms = selected_terms,
-    all_terms = all_terms,
+    term_specs = specs,
+    selected_index = sel,
+    selected_terms = sel_specs$label,
+    all_terms = specs$label,
     selection_history = selection_history
   )
 }
@@ -1678,29 +1482,8 @@ detect_variable_types <- function(X) {
   }, USE.NAMES = TRUE)
 }
 
-#' Snap values to nearest valid level for non-continuous variables
-#' @param x Named numeric vector of variable values
-#' @param var_types Named character vector from detect_variable_types()
-#' @param X Original data matrix (to extract unique levels for discrete vars)
-#' @return Snapped numeric vector
-snap_to_valid <- function(x, var_types, X) {
-  for (v in names(x)) {
-    vtype <- var_types[v]
-    if (is.na(vtype)) next
-    if (vtype == "dummy") {
-      levels <- sort(unique(X[, v]))
-      x[v] <- levels[which.min(abs(levels - x[v]))]
-    } else if (vtype == "discrete") {
-      levels <- sort(unique(X[, v]))
-      x[v] <- levels[which.min(abs(levels - x[v]))]
-    }
-  }
-  x
-}
-
 #' Enforce mutual exclusivity for categorical dummy groups
 #' For each group of dummies from the same category, at most one can be 1.
-#' If L-BFGS-B produced multiple 1s, keep the one closest to 1, set rest to 0.
 #' @param x Named numeric vector
 #' @param cat_groups List of integer vectors (column indices per group)
 #' @param var_names Variable names for indexing
@@ -1708,16 +1491,49 @@ snap_to_valid <- function(x, var_types, X) {
 enforce_categorical_constraints <- function(x, cat_groups, var_names) {
   for (grp_idx in cat_groups) {
     grp_vals <- x[var_names[grp_idx]]
-    # After snapping, each should be 0 or 1. If multiple are 1, keep highest raw value.
-    n_active <- sum(grp_vals >= 0.5)
-    if (n_active > 1) {
-      # Pick the one with highest raw value (most "confident")
+    if (sum(grp_vals >= 0.5) > 1) {
       winner <- grp_idx[which.max(grp_vals)]
       x[var_names[grp_idx]] <- 0
       x[var_names[winner]] <- 1
     }
   }
   x
+}
+
+#' Level name of each dummy column of a categorical variable
+#' @param info One entry of categorical_mapping
+#' @param dc Dummy column name(s)
+dummy_level <- function(info, dc) {
+  info$dummy_levels[match(dc, info$dummy_cols)]
+}
+
+#' Decode the active level of a categorical variable from a named 0/1 vector
+#' @param info One entry of categorical_mapping
+#' @param x Named numeric vector (or one-row list) containing the dummy columns
+#' @return Level name (reference level when no dummy is 1)
+decode_category <- function(info, x) {
+  for (k in seq_along(info$dummy_cols)) {
+    v <- x[[info$dummy_cols[k]]]
+    if (!is.null(v) && !is.na(v) && v == 1) return(info$dummy_levels[k])
+  }
+  info$reference
+}
+
+#' Keep only categorical variables (and their dummies) used in the model
+#' @param cm categorical_mapping
+#' @param var_names Variables in the model
+restrict_categorical_mapping <- function(cm, var_names) {
+  out <- list()
+  for (cat_name in names(cm)) {
+    info <- cm[[cat_name]]
+    keep <- info$dummy_cols %in% var_names
+    if (!any(keep)) next
+    info$dummy_cols <- info$dummy_cols[keep]
+    info$dummy_levels <- info$dummy_levels[keep]
+    info$levels <- c(info$reference, info$dummy_levels)
+    out[[cat_name]] <- info
+  }
+  out
 }
 
 #' Partition a set of "other" (non-axis) variable names into complete
@@ -1733,13 +1549,11 @@ enforce_categorical_constraints <- function(x, cat_groups, var_names) {
 partition_surface_vars <- function(other_vars, cm) {
   cat_groups <- list()
   covered <- character(0)
-  if (!is.null(cm)) {
-    for (cat_name in names(cm)) {
-      dcols <- cm[[cat_name]]$dummy_cols
-      if (length(dcols) > 0 && all(dcols %in% other_vars)) {
-        cat_groups[[cat_name]] <- dcols
-        covered <- c(covered, dcols)
-      }
+  for (cat_name in names(cm)) {
+    dcols <- cm[[cat_name]]$dummy_cols
+    if (length(dcols) > 0 && all(dcols %in% other_vars)) {
+      cat_groups[[cat_name]] <- dcols
+      covered <- c(covered, dcols)
     }
   }
   list(cat_groups = cat_groups, leftover = setdiff(other_vars, covered))
@@ -1752,34 +1566,13 @@ partition_surface_vars <- function(other_vars, cm) {
 #' @param cm categorical_mapping list
 #' @return List(tickvals, ticktext) or NULL if var_name is not a dummy column
 surface_axis_ticks <- function(var_name, cm) {
-  if (is.null(cm)) return(NULL)
   for (cat_name in names(cm)) {
     info <- cm[[cat_name]]
     if (var_name %in% info$dummy_cols) {
-      lvl <- sub(paste0("^", cat_name, "_"), "", var_name)
-      return(list(tickvals = c(0, 1), ticktext = c(info$reference, lvl)))
+      return(list(tickvals = c(0, 1), ticktext = c(info$reference, dummy_level(info, var_name))))
     }
   }
   NULL
-}
-
-#' Predict from RSM model with standard error at new points
-#' @param fit lm object from RSM analysis
-#' @param newdata Data frame of new points (original scale)
-#' @param mx Named vector of variable means (for centering)
-#' @param var_names Variable names
-#' @return List with mean predictions and standard errors
-rsm_predict_with_se <- function(fit, newdata, mx, var_names) {
-  df <- as.data.frame(newdata)
-  for (v in var_names) {
-    df[[paste0(v, "_c")]] <- df[[v]] - mx[v]
-  }
-  pred <- predict(fit, newdata = df, se.fit = TRUE)
-  list(
-    mean = as.numeric(pred$fit),
-    se = as.numeric(pred$se.fit),
-    residual_se = pred$residual.scale
-  )
 }
 
 #' Expected Improvement acquisition function
@@ -1790,236 +1583,219 @@ rsm_predict_with_se <- function(fit, newdata, mx, var_names) {
 #' @param target_value If not NULL, minimize (Y - target)^2 instead
 #' @return EI values (always non-negative) or acquisition scores for target mode
 expected_improvement <- function(mu, sigma, best_y, minimize = FALSE, target_value = NULL) {
-  sigma[sigma < 1e-10] <- 1e-10
+  # Non-finite SE (e.g. no residual degrees of freedom) → pure exploitation
+  sigma[!is.finite(sigma) | sigma < 1e-10] <- 1e-10
 
   if (!is.null(target_value)) {
     # Target mode: minimize (Y - target)^2
     # Point estimate of score + exploration bonus from uncertainty
     point_score <- (mu - target_value)^2
     improvement <- best_y - point_score  # best_y = best_score
-    acq <- improvement + sigma^2         # sigma^2 as exploration bonus
-    pmax(acq, 0)
+    pmax(improvement + sigma^2, 0)
   } else {
-    if (minimize) {
-      improvement <- best_y - mu
-    } else {
-      improvement <- mu - best_y
-    }
-
+    improvement <- if (minimize) best_y - mu else mu - best_y
     z <- improvement / sigma
-    ei <- improvement * pnorm(z) + sigma * dnorm(z)
-    ei[sigma < 1e-10] <- 0
-    ei
+    pmax(improvement * pnorm(z) + sigma * dnorm(z), 0)
   }
 }
 
 #' Run Bayesian Optimization using RSM regression as surrogate
-#' @param fit lm object from RSM
+#' @param predictor Prediction function from make_rsm_predictor()
 #' @param X Original predictor matrix
-#' @param y Original response vector
-#' @param mx Named vector of variable means
 #' @param var_names Variable names
 #' @param n_iter Number of BO iterations
 #' @param n_random Number of random candidates per iteration
 #' @param minimize If TRUE, seek minimum; if FALSE, seek maximum
 #' @param bounds 2 x p matrix (row 1 = lower, row 2 = upper). NULL = data range
+#' @param categorical_mapping Categorical mapping (mutual exclusivity of dummies)
 #' @param target_value If not NULL, minimize (Y - target)^2
+#' @param patience Stop after this many consecutive iterations with negligible EI
 #' @return List with best_x, best_y, history, convergence
 run_bayesian_optimization <- function(
-    fit, X, y, mx, var_names,
+    predictor, X, var_names,
     n_iter = 30,
     n_random = 500,
     minimize = FALSE,
     bounds = NULL,
     categorical_mapping = NULL,
-    target_value = NULL
+    target_value = NULL,
+    patience = 3
 ) {
-  # Target mode forces minimize on (Y - target)^2
   use_target <- !is.null(target_value)
+  X <- X[, var_names, drop = FALSE]
   p <- length(var_names)
 
-  # Detect variable types (dummy / discrete / continuous)
+  # Variable types (dummy / discrete / continuous)
   var_types <- detect_variable_types(X)
+  is_disc <- var_types %in% c("dummy", "discrete")
+  cont_idx <- which(!is_disc)
+  disc_idx <- which(is_disc)
+  levels_list <- lapply(seq_len(p), function(j) if (is_disc[j]) sort(unique(X[, j])) else NULL)
 
-  # Pre-compute unique levels for discrete/dummy variables
-  discrete_levels <- lapply(var_names, function(v) {
-    if (var_types[v] %in% c("dummy", "discrete")) {
-      sort(unique(X[, v]))
-    } else {
-      NULL
-    }
-  })
-  names(discrete_levels) <- var_names
-
-  # Build categorical group information for mutual exclusivity
-  # cat_groups: list of lists, each with dummy column indices in var_names
+  # Categorical groups (column indices) for mutual exclusivity
   cat_groups <- list()
-  if (!is.null(categorical_mapping)) {
-    for (cat_name in names(categorical_mapping)) {
-      grp_cols <- categorical_mapping[[cat_name]]$dummy_cols
-      grp_idx <- which(var_names %in% grp_cols)
-      if (length(grp_idx) >= 2) {
-        cat_groups[[cat_name]] <- grp_idx
-      }
-    }
+  for (cat_name in names(categorical_mapping)) {
+    grp_idx <- which(var_names %in% categorical_mapping[[cat_name]]$dummy_cols)
+    if (length(grp_idx) >= 2) cat_groups[[cat_name]] <- grp_idx
   }
 
-  # Default bounds from data range
   if (is.null(bounds)) {
-    bounds <- rbind(
-      apply(X, 2, min, na.rm = TRUE),
-      apply(X, 2, max, na.rm = TRUE)
-    )
+    bounds <- rbind(apply(X, 2, min), apply(X, 2, max))
     colnames(bounds) <- var_names
   }
 
-  # Evaluate model at all observed data points
-  pred_init <- rsm_predict_with_se(fit, as.data.frame(X), mx, var_names)
-  if (use_target) {
-    scores_init <- (pred_init$mean - target_value)^2
-    best_idx <- which.min(scores_init)
-    best_score <- scores_init[best_idx]
-  } else if (minimize) {
-    best_idx <- which.min(pred_init$mean)
-  } else {
-    best_idx <- which.max(pred_init$mean)
+  # Score: lower is better in every mode
+  score_of <- function(mu) {
+    if (use_target) (mu - target_value)^2 else if (minimize) mu else -mu
   }
-  best_y <- pred_init$mean[best_idx]
-  best_x <- as.numeric(X[best_idx, ])
-  names(best_x) <- var_names
+  predict_one <- function(x) predictor(matrix(x, nrow = 1, dimnames = list(NULL, var_names)))
+  snap <- function(x) {
+    for (j in disc_idx) {
+      lv <- levels_list[[j]]
+      x[j] <- lv[which.min(abs(lv - x[j]))]
+    }
+    enforce_categorical_constraints(x, cat_groups, var_names)
+  }
 
-  # History tracking
-  history_list <- list()
-  history_list[[1]] <- list(
+  # Start from the best model prediction over the observed points
+  pred_init <- predictor(X)
+  scores_init <- score_of(pred_init$mean)
+  best_idx <- which.min(scores_init)
+  best_score <- scores_init[best_idx]
+  best_y <- pred_init$mean[best_idx]
+  best_x <- setNames(as.numeric(X[best_idx, ]), var_names)
+
+  history_list <- list(list(
     iteration = 0, x = best_x, predicted_y = best_y,
     ei = NA_real_, se = pred_init$se[best_idx], type = "initial"
-  )
+  ))
   convergence_y <- best_y
-  ei_best <- if (use_target) best_score else best_y
+  ei_ref <- function() if (use_target) best_score else best_y
+  stall <- 0
+  n_done <- 0
 
   for (iter in seq_len(n_iter)) {
-    # Random candidate generation - respecting variable types
-    candidates <- matrix(nrow = n_random, ncol = p)
-    for (j in seq_len(p)) {
-      v <- var_names[j]
-      if (var_types[v] %in% c("dummy", "discrete")) {
-        lvls <- discrete_levels[[v]]
-        candidates[, j] <- sample(lvls, n_random, replace = TRUE)
-      } else {
-        candidates[, j] <- runif(n_random, bounds[1, j], bounds[2, j])
-      }
+    n_done <- iter
+    # Random candidates respecting variable types
+    candidates <- matrix(0, n_random, p, dimnames = list(NULL, var_names))
+    for (j in cont_idx) candidates[, j] <- runif(n_random, bounds[1, j], bounds[2, j])
+    for (j in disc_idx) {
+      lv <- levels_list[[j]]
+      candidates[, j] <- lv[sample.int(length(lv), n_random, replace = TRUE)]
     }
-    colnames(candidates) <- var_names
-
-    # Enforce mutual exclusivity for categorical groups
-    # For each group of dummies from the same original category,
-    # at most one dummy can be 1 (the rest must be 0)
+    # Categorical groups: exactly one level active per row (all 0 = reference)
     for (grp_idx in cat_groups) {
-      for (row in seq_len(n_random)) {
-        # Randomly choose: either one dummy is 1, or all are 0 (= reference level)
-        active <- sample(c(0, grp_idx), 1)  # 0 means reference (all dummies = 0)
-        candidates[row, grp_idx] <- 0L
-        if (active > 0) {
-          candidates[row, active] <- 1L
-        }
-      }
+      active <- sample(c(0L, grp_idx), n_random, replace = TRUE)
+      candidates[, grp_idx] <- 0
+      on <- which(active > 0)
+      candidates[cbind(on, active[on])] <- 1
     }
 
-    # Predict and compute EI at candidates
-    pred <- rsm_predict_with_se(fit, as.data.frame(candidates), mx, var_names)
-    ei <- expected_improvement(pred$mean, pred$se, ei_best, minimize, target_value)
+    pred <- predictor(candidates)
+    ei <- expected_improvement(pred$mean, pred$se, ei_ref(), minimize, target_value)
+    ei[!is.finite(ei)] <- -Inf
+    if (all(ei == -Inf)) break
 
-    # Best random candidate
-    best_cand_idx <- which.max(ei)
-    new_x <- candidates[best_cand_idx, ]
-    new_ei <- ei[best_cand_idx]
+    bi <- which.max(ei)
+    new_x <- candidates[bi, ]
+    new_ei <- ei[bi]
 
-    # L-BFGS-B refinement (only for continuous variables)
-    # For mixed problems: optimize continuous vars, snap discrete after
-    tryCatch({
-      obj_fn <- function(x_vec) {
-        names(x_vec) <- var_names
-        # Snap discrete/dummy variables and enforce categorical constraints
-        x_vec <- snap_to_valid(x_vec, var_types, X)
-        x_vec <- enforce_categorical_constraints(x_vec, cat_groups, var_names)
-        df_tmp <- as.data.frame(t(x_vec))
-        p_tmp <- rsm_predict_with_se(fit, df_tmp, mx, var_names)
-        -expected_improvement(p_tmp$mean, p_tmp$se, ei_best, minimize, target_value)
-      }
-
-      opt_result <- optim(
-        par = new_x,
-        fn = obj_fn,
+    # L-BFGS-B refinement of EI over continuous variables (discrete fixed)
+    if (length(cont_idx) > 0) {
+      base_x <- new_x
+      ref <- ei_ref()
+      opt <- tryCatch(optim(
+        par = new_x[cont_idx],
+        fn = function(xc) {
+          x <- base_x
+          x[cont_idx] <- xc
+          pr <- predict_one(x)
+          v <- -expected_improvement(pr$mean, pr$se, ref, minimize, target_value)
+          if (is.finite(v)) v else 0
+        },
         method = "L-BFGS-B",
-        lower = bounds[1, ],
-        upper = bounds[2, ]
-      )
-
-      if (-opt_result$value > new_ei) {
-        new_x <- opt_result$par
-        names(new_x) <- var_names
-        new_ei <- -opt_result$value
-      }
-    }, error = function(e) NULL)
-
-    # Snap discrete/dummy variables to valid levels, then enforce mutual exclusivity
-    names(new_x) <- var_names
-    new_x <- snap_to_valid(new_x, var_types, X)
-    new_x <- enforce_categorical_constraints(new_x, cat_groups, var_names)
-    new_pred <- rsm_predict_with_se(fit, as.data.frame(t(new_x)), mx, var_names)
-    new_y <- new_pred$mean[1]
-    new_se <- new_pred$se[1]
-
-    # Update best
-    if (use_target) {
-      new_score <- (new_y - target_value)^2
-      improved <- new_score < best_score
-      if (improved) {
-        best_score <- new_score
-        best_y <- new_y
-        best_x <- new_x
-        ei_best <- best_score
-      }
-    } else {
-      improved <- if (minimize) (new_y < best_y) else (new_y > best_y)
-      if (improved) {
-        best_y <- new_y
-        best_x <- new_x
-        ei_best <- best_y
+        lower = bounds[1, cont_idx],
+        upper = bounds[2, cont_idx]
+      ), error = function(e) NULL)
+      if (!is.null(opt) && is.finite(opt$value) && -opt$value > new_ei) {
+        new_x[cont_idx] <- opt$par
+        new_ei <- -opt$value
       }
     }
 
-    history_list[[iter + 1]] <- list(
+    new_x <- snap(new_x)
+    new_pred <- predict_one(new_x)
+    new_y <- new_pred$mean[1]
+    new_score <- score_of(new_y)
+
+    improved <- is.finite(new_score) && new_score < best_score
+    if (improved) {
+      best_score <- new_score
+      best_y <- new_y
+      best_x <- new_x
+    }
+
+    history_list[[length(history_list) + 1]] <- list(
       iteration = iter, x = new_x, predicted_y = new_y,
-      ei = new_ei, se = new_se,
+      ei = new_ei, se = new_pred$se[1],
       type = if (improved) "improved" else "explored"
     )
     convergence_y <- c(convergence_y, best_y)
 
-    # Early stop if EI negligible
-    if (new_ei < 1e-12) break
+    # Early stop after several consecutive iterations with negligible EI
+    stall <- if (new_ei < 1e-12) stall + 1 else 0
+    if (stall >= patience) break
   }
 
-  # Build tidy data frames
-  history_df <- do.call(rbind, lapply(history_list, function(h) {
-    x_vals <- as.list(h$x)
-    names(x_vals) <- var_names
-    c(
-      list(iteration = h$iteration),
-      x_vals,
-      list(
-        predicted_y = h$predicted_y,
-        EI = h$ei,
-        SE = h$se,
-        type = h$type
+  # Final exploitation: locally optimize the predicted value itself around the
+  # incumbent (discrete levels fixed), so the reported optimum is a true local
+  # optimum of the response surface rather than the last sampled point.
+  if (length(cont_idx) > 0) {
+    base_x <- best_x
+    opt <- tryCatch(optim(
+      par = best_x[cont_idx],
+      fn = function(xc) {
+        x <- base_x
+        x[cont_idx] <- xc
+        v <- score_of(predict_one(x)$mean)
+        if (is.finite(v)) v else .Machine$double.xmax
+      },
+      method = "L-BFGS-B",
+      lower = bounds[1, cont_idx],
+      upper = bounds[2, cont_idx]
+    ), error = function(e) NULL)
+    if (!is.null(opt) && is.finite(opt$value) &&
+        opt$value < best_score - 1e-12 * max(1, abs(best_score))) {
+      cand_x <- best_x
+      cand_x[cont_idx] <- opt$par
+      cand_pred <- predict_one(cand_x)
+      best_score <- score_of(cand_pred$mean[1])
+      best_y <- cand_pred$mean[1]
+      best_x <- cand_x
+      history_list[[length(history_list) + 1]] <- list(
+        iteration = length(history_list), x = best_x, predicted_y = best_y,
+        ei = NA_real_, se = cand_pred$se[1], type = "improved"
       )
-    ) |> as.data.frame(stringsAsFactors = FALSE, check.names = FALSE)
-  }))
+      convergence_y <- c(convergence_y, best_y)
+    }
+  }
+
+  # Tidy data frames
+  hx <- do.call(rbind, lapply(history_list, function(h) h$x))
+  history_df <- data.frame(
+    iteration = vapply(history_list, function(h) h$iteration, numeric(1)),
+    stringsAsFactors = FALSE
+  )
+  history_df <- cbind(history_df, as.data.frame(hx, stringsAsFactors = FALSE, optional = TRUE))
+  names(history_df) <- c("iteration", var_names)
+  history_df$predicted_y <- vapply(history_list, function(h) h$predicted_y, numeric(1))
+  history_df$EI <- vapply(history_list, function(h) h$ei, numeric(1))
+  history_df$SE <- vapply(history_list, function(h) h$se, numeric(1))
+  history_df$type <- vapply(history_list, function(h) h$type, character(1))
 
   convergence_df <- data.frame(
     iteration = seq(0, length(convergence_y) - 1),
-    best_y = convergence_y,
-    stringsAsFactors = FALSE
+    best_y = convergence_y
   )
 
   list(
@@ -2030,7 +1806,7 @@ run_bayesian_optimization <- function(
     bounds = bounds,
     minimize = minimize,
     var_types = var_types,
-    n_iter_actual = length(history_list) - 1,
+    n_iter_actual = n_done,
     target_value = target_value,
     categorical_mapping = categorical_mapping
   )
@@ -2485,6 +2261,8 @@ ui <- fluidPage(
 server <- function(input, output, session) {
 
   # Reactive values
+  run_counter <- 0  # Incremented per analysis; makes dynamic input IDs unique per run
+
   rv <- reactiveValues(
     data = NULL,
     analysis = NULL  # Combined fit, cv_fit, and results
@@ -2501,12 +2279,19 @@ server <- function(input, output, session) {
     # CSV mode
     if (mode == "csv" && !is.null(input$data_file)) {
       tryCatch({
+        enc <- input$encoding %||% "UTF-8"
+        # "UTF-8-BOM" also reads plain UTF-8 and strips an Excel BOM
+        if (enc == "UTF-8") enc <- "UTF-8-BOM"
         df <- read.csv(
           input$data_file$datapath,
           header = isTRUE(input$header),
-          fileEncoding = input$encoding %||% "UTF-8",
-          stringsAsFactors = FALSE
+          fileEncoding = enc,
+          stringsAsFactors = FALSE,
+          check.names = FALSE,
+          comment.char = "",
+          strip.white = TRUE
         )
+        df <- sanitize_column_names(df)
         showNotification("CSVファイルを読み込みました", type = "message", duration = 3)
         df
       }, error = function(e) {
@@ -2528,8 +2313,13 @@ server <- function(input, output, session) {
             sep = sep,
             header = isTRUE(input$header),
             stringsAsFactors = FALSE,
-            check.names = FALSE
+            check.names = FALSE,
+            quote = "\"",
+            comment.char = "",
+            strip.white = TRUE,
+            blank.lines.skip = TRUE
           ))
+          df <- sanitize_column_names(df)
           showNotification("貼り付けデータを読み込みました", type = "message", duration = 3)
           df
         }, error = function(e) {
@@ -2738,9 +2528,8 @@ server <- function(input, output, session) {
           analysis_result$interaction_matrix
         )
 
-        # n_params = main effects + interaction terms + quadratic terms
-        n_params <- active_counts$n_main + active_counts$n_higher_order
-        metrics <- compute_metrics(y, analysis_result$predictions, n_params)
+        # n_params = estimable coefficients (excluding intercept)
+        metrics <- compute_metrics(y, analysis_result$predictions, analysis_result$n_params)
 
         incProgress(0.15, detail = "結果整理中")
 
@@ -2748,8 +2537,18 @@ server <- function(input, output, session) {
         n_selected <- length(analysis_result$selected_terms)
         n_total <- length(analysis_result$all_terms)
 
+        # Categorical variables actually present in this model
+        cm_used <- restrict_categorical_mapping(rv$categorical_mapping, colnames(X))
+        run_counter <<- run_counter + 1
+
         # Store results
         rv$analysis <- list(
+          run_id = run_counter,
+          target_name = input$target_var,
+          cm = cm_used,
+          var_types = detect_variable_types(X),
+          is_dummy = analysis_result$is_dummy,
+          predictor = analysis_result$predictor,
           y = y,
           X = X,
           var_names = colnames(X),
@@ -2802,16 +2601,14 @@ server <- function(input, output, session) {
         set.seed(RANDOM_SEED)
         bo_result <- tryCatch({
           run_bayesian_optimization(
-            fit = analysis_result$fit,
+            predictor = analysis_result$predictor,
             X = X,
-            y = y,
-            mx = analysis_result$mx,
             var_names = colnames(X),
             n_iter = 30,
             n_random = 500,
             minimize = minimize,
             bounds = NULL,
-            categorical_mapping = rv$categorical_mapping,
+            categorical_mapping = cm_used,
             target_value = target_val
           )
         }, error = function(e) {
@@ -2833,8 +2630,8 @@ server <- function(input, output, session) {
         } else ""
 
         showNotification(
-          sprintf("分析・最適化完了（R²=%.3f%s）",
-                  metrics$r_squared %||% 0, bo_info),
+          sprintf("分析・最適化完了（R²=%s%s）",
+                  if (is.na(metrics$r_squared)) "NA" else sprintf("%.3f", metrics$r_squared), bo_info),
           type = "message",
           duration = 5
         )
@@ -2963,11 +2760,13 @@ server <- function(input, output, session) {
       main_effects,
       interaction_matrix,
       res$var_names,
-      input$target_var,
+      res$target_name %||% "Y",
       scale = scale,
-      mx = res$mx
+      mx = res$mx,
+      is_dummy = res$is_dummy
     )
-    HTML(equation)
+    # Variable names come from user data: escape before rendering as HTML
+    HTML(htmltools::htmlEscape(equation))
   })
 
   # -------------------------------------------------------------------------
@@ -3068,8 +2867,13 @@ server <- function(input, output, session) {
       return(ggplotly(p, tooltip = "text") |> layout_rsm())
     }
 
-    range_min <- min(c(df$actual, df$predicted)) * 0.95
-    range_max <- max(c(df$actual, df$predicted)) * 1.05
+    # Pad by 5% of the data range (multiplying by 0.95/1.05 would clip points
+    # when values are negative)
+    range_min <- min(c(df$actual, df$predicted))
+    range_max <- max(c(df$actual, df$predicted))
+    pad <- 0.05 * (range_max - range_min)
+    range_min <- range_min - pad
+    range_max <- range_max + pad
 
     # Handle identical values (zero range)
     if (abs(range_max - range_min) < .Machine$double.eps) {
@@ -3090,7 +2894,7 @@ server <- function(input, output, session) {
       geom_abline(intercept = 0, slope = 1, color = COLORS$border, linetype = "dashed", linewidth = 1) +
       geom_ribbon(
         data = data.frame(x = seq(range_min, range_max, length.out = 100)),
-        aes(x = x, ymin = x * 0.9, ymax = x * 1.1),
+        aes(x = x, ymin = pmin(x * 0.9, x * 1.1), ymax = pmax(x * 0.9, x * 1.1)),
         inherit.aes = FALSE,
         fill = COLORS$accent_purple, alpha = 0.08
       )
@@ -3319,37 +3123,14 @@ server <- function(input, output, session) {
     req(rv$analysis)
     res <- rv$analysis
     var_names <- res$var_names
-    int_mat <- res$interaction_matrix_std
+    int_mat <- abs(res$interaction_matrix_std)
 
-    # Calculate total importance: |main| + Σ|interactions| + |quadratic|
-    importance <- sapply(var_names, function(v) {
-      # Main effect
-      main_contrib <- abs(res$main_effects_std[v])
-
-      # Quadratic term (diagonal)
-      idx <- which(var_names == v)
-      quad_contrib <- if (length(idx) == 1) abs(int_mat[idx, idx]) else 0
-
-      # Interaction terms (row + column, avoiding double count)
-      int_contrib <- 0
-      if (length(idx) == 1 && !is.null(int_mat)) {
-        # Sum of absolute interaction coefficients involving this variable
-        row_vals <- int_mat[idx, ]
-        col_vals <- int_mat[, idx]
-        # Upper triangle only to avoid double counting, exclude diagonal
-        for (j in seq_along(var_names)) {
-          if (j != idx) {
-            int_contrib <- int_contrib + abs(int_mat[min(idx, j), max(idx, j)])
-          }
-        }
-      }
-
-      main_contrib + quad_contrib + int_contrib
-    })
+    # Total importance: |main| + |quadratic| + Σ|interactions involving the variable|
+    # (the matrix is symmetric, so the row sum covers each interaction once)
+    importance <- abs(res$main_effects_std[var_names]) + rowSums(int_mat)
     names(importance) <- var_names
     ranked_vars <- names(sort(importance, decreasing = TRUE))
 
-    # Update selectors with ranked variables
     updateSelectInput(session, "surface_var1",
                       choices = ranked_vars,
                       selected = if (length(ranked_vars) >= 1) ranked_vars[1] else NULL)
@@ -3358,32 +3139,43 @@ server <- function(input, output, session) {
                       selected = if (length(ranked_vars) >= 2) ranked_vars[2] else NULL)
   })
 
+  # Dynamic input IDs are index based (user column names may contain any
+  # character) and include the analysis run id, so values left over from a
+  # previous analysis are never applied to a different variable.
+  surface_slider_id <- function(res, v) {
+    sprintf("surface_slider_%d_%d", res$run_id, match(v, res$var_names))
+  }
+  surface_cat_id <- function(res, cat_name) {
+    sprintf("surface_cat_%d_%d", res$run_id, match(cat_name, names(res$cm)))
+  }
+
+  # Decimal places appropriate for a variable's data range
+  range_decimals <- function(x_col) {
+    x_range <- diff(range(x_col))
+    if (x_range > 0) max(0, min(2 - floor(log10(x_range)), 6)) else 2
+  }
+
   # Dynamic slider UI for 3rd+ variables
   output$surface_slider_ui <- renderUI({
     req(rv$analysis)
     res <- rv$analysis
     var_names <- res$var_names
-    cm <- rv$categorical_mapping
+    cm <- res$cm
 
-    # Get selected X and Y axis variables
     var1 <- input$surface_var1
     var2 <- input$surface_var2
-
     if (is.null(var1) || is.null(var2)) return(NULL)
 
-    # Other variables (not on axes)
     other_vars <- setdiff(var_names, c(var1, var2))
-
     if (length(other_vars) == 0) {
       return(p(style = sprintf("color: %s; font-size: 0.8rem;", COLORS$text_muted),
                "他の変数なし（2変数モデル）"))
     }
 
-    # Split into complete categorical groups (rendered as one dropdown per
-    # category) vs. leftover numeric/discrete vars (rendered as sliders)
+    # Split into complete categorical groups (one dropdown per category)
+    # vs. leftover numeric/discrete vars (sliders)
     parts <- partition_surface_vars(other_vars, cm)
 
-    # One category selector per complete categorical group
     cat_controls <- lapply(names(parts$cat_groups), function(cat_name) {
       info <- cm[[cat_name]]
       tagList(
@@ -3394,7 +3186,7 @@ server <- function(input, output, session) {
           tags$span(style = sprintf("font-size: 0.6rem; color: %s;", COLORS$accent_purple), " [カテゴリ]")
         ),
         selectInput(
-          inputId = paste0("surface_cat_", make.names(cat_name)),
+          inputId = surface_cat_id(res, cat_name),
           label = NULL,
           choices = info$levels,
           selected = info$levels[1]
@@ -3402,65 +3194,49 @@ server <- function(input, output, session) {
       )
     })
 
-    # Create sliders with Low/Center/High presets for each leftover variable
-    slider_list <- lapply(parts$leftover, function(v) {
-      # Get range from original data
-      x_col <- res$X[, v]
-      x_min <- min(x_col, na.rm = TRUE)
-      x_max <- max(x_col, na.rm = TRUE)
-      x_mean <- mean(x_col, na.rm = TRUE)
+    preset_button <- function(idx, kind, label, color) {
+      # One shared input event for all preset buttons (no per-variable observers)
+      tags$button(
+        type = "button",
+        class = "btn btn-default btn-xs",
+        style = sprintf("padding: 2px 6px; font-size: 0.65rem; background: %s; border: 1px solid %s; color: %s;",
+                        COLORS$bg_tertiary, COLORS$border, color),
+        onclick = sprintf(
+          "Shiny.setInputValue('surface_preset', {run: %d, idx: %d, kind: '%s'}, {priority: 'event'})",
+          res$run_id, idx, kind
+        ),
+        label
+      )
+    }
 
-      # Determine appropriate decimal places based on data scale
-      x_range <- x_max - x_min
-      if (x_range > 0) {
-        # Calculate decimals needed to show meaningful step changes
-        magnitude <- floor(log10(x_range))
-        decimals <- max(0, 2 - magnitude)  # More decimals for smaller ranges
-        decimals <- min(decimals, 6)  # Cap at 6 decimal places
-      } else {
-        decimals <- 2
-      }
-      round_val <- function(x) round(x, decimals)
-      step_val <- round(x_range / 20, decimals + 1)
+    slider_list <- lapply(parts$leftover, function(v) {
+      idx <- match(v, var_names)
+      x_col <- res$X[, v]
+      x_min <- min(x_col)
+      x_max <- max(x_col)
+      x_mean <- mean(x_col)
+      decimals <- range_decimals(x_col)
+      step_val <- round((x_max - x_min) / 20, decimals + 1)
       if (step_val == 0) step_val <- 10^(-decimals)
 
       tagList(
         div(
           style = "margin-bottom: 0.5rem;",
-          span(style = sprintf("color: %s; font-size: 0.8rem; font-weight: 600;", COLORS$text_primary),
-               v),
-          # Low/Center/High preset buttons
+          span(style = sprintf("color: %s; font-size: 0.8rem; font-weight: 600;", COLORS$text_primary), v),
           div(
             style = "display: inline-flex; gap: 4px; margin-left: 8px;",
-            actionButton(
-              inputId = paste0("surface_preset_low_", v),
-              label = "Low",
-              class = "btn-xs",
-              style = sprintf("padding: 2px 6px; font-size: 0.65rem; background: %s; border: 1px solid %s; color: %s;",
-                            COLORS$bg_tertiary, COLORS$border, COLORS$accent_blue)
-            ),
-            actionButton(
-              inputId = paste0("surface_preset_center_", v),
-              label = "Center",
-              class = "btn-xs",
-              style = sprintf("padding: 2px 6px; font-size: 0.65rem; background: %s; border: 1px solid %s; color: %s;",
-                            COLORS$bg_tertiary, COLORS$border, COLORS$accent_green)
-            ),
-            actionButton(
-              inputId = paste0("surface_preset_high_", v),
-              label = "High",
-              class = "btn-xs",
-              style = sprintf("padding: 2px 6px; font-size: 0.65rem; background: %s; border: 1px solid %s; color: %s;",
-                            COLORS$bg_tertiary, COLORS$border, COLORS$accent_red)
-            )
+            preset_button(idx, "low", "Low", COLORS$accent_blue),
+            preset_button(idx, "center", "Center", COLORS$accent_green),
+            preset_button(idx, "high", "High", COLORS$accent_red)
           )
         ),
         sliderInput(
-          inputId = paste0("surface_slider_", v),
+          inputId = surface_slider_id(res, v),
           label = NULL,
-          min = round_val(x_min),
-          max = round_val(x_max),
-          value = round_val(x_mean),
+          # floor/ceiling so rounding never cuts off the data range
+          min = floor(x_min * 10^decimals) / 10^decimals,
+          max = ceiling(x_max * 10^decimals) / 10^decimals,
+          value = round(x_mean, decimals),
           step = step_val
         ),
         p(style = sprintf("color: %s; font-size: 0.65rem; margin-top: -10px;", COLORS$text_muted),
@@ -3477,55 +3253,22 @@ server <- function(input, output, session) {
     )
   })
 
-  # Observers for Low/Center/High preset buttons
-  # Use once=TRUE to prevent multiple observer registration (Shiny common pitfall)
-  # Observers are created once for all variables; values are computed dynamically
-  observe({
+  # Low/Center/High preset buttons (single observer for all variables)
+  observeEvent(input$surface_preset, {
     req(rv$analysis)
-    var_names <- rv$analysis$var_names
-
-    # Create observers only once for each variable
-    lapply(var_names, function(v) {
-      # Helper to get appropriate decimal places for this variable's data range
-      get_decimals <- function(x_col) {
-        x_range <- diff(range(x_col, na.rm = TRUE))
-        if (x_range > 0) {
-          magnitude <- floor(log10(x_range))
-          decimals <- max(0, min(2 - magnitude, 6))
-        } else {
-          decimals <- 2
-        }
-        decimals
-      }
-
-      # Low button - get current values dynamically inside handler
-      observeEvent(input[[paste0("surface_preset_low_", v)]], {
-        req(rv$analysis, v %in% colnames(rv$analysis$X))
-        x_col <- rv$analysis$X[, v]
-        decimals <- get_decimals(x_col)
-        x_min <- min(x_col, na.rm = TRUE)
-        updateSliderInput(session, paste0("surface_slider_", v), value = round(x_min, decimals))
-      }, ignoreInit = TRUE)
-
-      # Center button
-      observeEvent(input[[paste0("surface_preset_center_", v)]], {
-        req(rv$analysis, v %in% colnames(rv$analysis$X))
-        x_col <- rv$analysis$X[, v]
-        decimals <- get_decimals(x_col)
-        x_mean <- mean(x_col, na.rm = TRUE)
-        updateSliderInput(session, paste0("surface_slider_", v), value = round(x_mean, decimals))
-      }, ignoreInit = TRUE)
-
-      # High button
-      observeEvent(input[[paste0("surface_preset_high_", v)]], {
-        req(rv$analysis, v %in% colnames(rv$analysis$X))
-        x_col <- rv$analysis$X[, v]
-        decimals <- get_decimals(x_col)
-        x_max <- max(x_col, na.rm = TRUE)
-        updateSliderInput(session, paste0("surface_slider_", v), value = round(x_max, decimals))
-      }, ignoreInit = TRUE)
-    })
-  }) |> bindEvent(rv$analysis, once = TRUE)  # Run only once when first analysis completes
+    res <- rv$analysis
+    ev <- input$surface_preset
+    # Ignore clicks from UI of a previous analysis
+    if (!identical(as.integer(ev$run), as.integer(res$run_id))) return()
+    idx <- as.integer(ev$idx)
+    if (is.na(idx) || idx < 1 || idx > length(res$var_names)) return()
+    v <- res$var_names[idx]
+    x_col <- res$X[, v]
+    decimals <- range_decimals(x_col)
+    value <- switch(ev$kind, low = min(x_col), center = mean(x_col), high = max(x_col), NULL)
+    if (is.null(value)) return()
+    updateSliderInput(session, surface_slider_id(res, v), value = round(value, decimals))
+  })
 
   # Extrapolation warning message
   output$extrapolation_warning <- renderUI({
@@ -3550,165 +3293,156 @@ server <- function(input, output, session) {
     }
   })
 
-  # 3D Surface plot
-  output$surface_plot <- renderPlotly({
+  # Shared prediction grid for the 3D surface and contour plots
+  # (computed once per input change instead of once per plot)
+  surface_data <- reactive({
     req(rv$analysis, input$surface_var1, input$surface_var2)
     res <- rv$analysis
-
     var1 <- input$surface_var1
     var2 <- input$surface_var2
-
-    # Validation
-    if (var1 == var2) {
-      return(plotly_empty() |> layout(title = "X軸とY軸に異なる変数を選択してください"))
-    }
-
     var_names <- res$var_names
-    cm <- rv$categorical_mapping
-    resolution <- input$surface_resolution %||% 25
-    show_points <- isTRUE(input$surface_show_points)
+    req(var1 %in% var_names, var2 %in% var_names)
+    if (var1 == var2) return(list(error = "X軸とY軸に異なる変数を選択してください"))
 
-    # Get data ranges for selected variables
+    cm <- res$cm
+    resolution <- input$surface_resolution %||% 25
+
     x1_data <- res$X[, var1]
     x2_data <- res$X[, var2]
-    x1_range <- range(x1_data, na.rm = TRUE)
-    x2_range <- range(x2_data, na.rm = TRUE)
+    x1_range <- range(x1_data)
+    x2_range <- range(x2_data)
 
-    # Expand range only if extrapolation is allowed (default: within data range only)
+    # Expand range only if extrapolation is allowed (default: data range only)
     allow_extrap <- isTRUE(input$surface_allow_extrapolation)
     x1_expand <- if (allow_extrap) diff(x1_range) * 0.1 else 0
     x2_expand <- if (allow_extrap) diff(x2_range) * 0.1 else 0
 
-    # Dummy/discrete axes are shown at their actual levels (e.g. {0,1}) instead
-    # of an interpolated continuous grid, which would be meaningless for them
-    var_types <- detect_variable_types(res$X)
-    x1_is_snapped <- !is.na(var_types[var1]) && var_types[var1] %in% c("dummy", "discrete")
-    x2_is_snapped <- !is.na(var_types[var2]) && var_types[var2] %in% c("dummy", "discrete")
-    x1_seq <- if (x1_is_snapped) sort(unique(x1_data)) else
+    # Dummy/discrete axes are shown at their actual levels (e.g. {0,1})
+    var_types <- res$var_types
+    x1_seq <- if (var_types[[var1]] %in% c("dummy", "discrete")) sort(unique(x1_data)) else
       seq(x1_range[1] - x1_expand, x1_range[2] + x1_expand, length.out = resolution)
-    x2_seq <- if (x2_is_snapped) sort(unique(x2_data)) else
+    x2_seq <- if (var_types[[var2]] %in% c("dummy", "discrete")) sort(unique(x2_data)) else
       seq(x2_range[1] - x2_expand, x2_range[2] + x2_expand, length.out = resolution)
     n1 <- length(x1_seq)
     n2 <- length(x2_seq)
 
-    # Create prediction grid
-    grid <- expand.grid(x1 = x1_seq, x2 = x2_seq)
-    names(grid) <- c(var1, var2)
-
-    # Set other variables: complete categorical groups from their dropdown,
-    # leftover continuous/discrete variables from their slider (or mean)
+    # Fixed values for the other variables
+    fixed <- setNames(numeric(length(var_names)), var_names)
     other_vars <- setdiff(var_names, c(var1, var2))
     parts <- partition_surface_vars(other_vars, cm)
     for (v in parts$leftover) {
-      slider_id <- paste0("surface_slider_", v)
-      slider_val <- input[[slider_id]]
-      if (is.null(slider_val)) {
-        slider_val <- mean(res$X[, v], na.rm = TRUE)
-      }
-      grid[[v]] <- slider_val
+      val <- input[[surface_slider_id(res, v)]]
+      fixed[v] <- if (is.null(val) || is.na(val)) mean(res$X[, v]) else val
     }
     for (cat_name in names(parts$cat_groups)) {
-      dcols <- parts$cat_groups[[cat_name]]
       info <- cm[[cat_name]]
-      sel_level <- input[[paste0("surface_cat_", make.names(cat_name))]] %||% info$levels[1]
-      for (dc in dcols) {
-        lvl <- sub(paste0("^", cat_name, "_"), "", dc)
-        grid[[dc]] <- as.integer(identical(lvl, sel_level))
-      }
+      sel_level <- input[[surface_cat_id(res, cat_name)]] %||% info$levels[1]
+      dcols <- parts$cat_groups[[cat_name]]
+      fixed[dcols] <- as.numeric(dummy_level(info, dcols) == sel_level)
     }
 
-    # Reorder columns to match original variable order
-    grid <- grid[, var_names, drop = FALSE]
+    # Prediction grid (x1 varies fastest)
+    grid <- matrix(rep(fixed, each = n1 * n2), nrow = n1 * n2,
+                   dimnames = list(NULL, var_names))
+    grid[, var1] <- rep(x1_seq, times = n2)
+    grid[, var2] <- rep(x2_seq, each = n1)
 
-    # Add centered columns for quadratic terms (Xi_c = Xi - mean(Xi))
-    # Uses original training data means from res$mx
-    for (v in var_names) {
-      centered_col <- paste0(v, "_c")
-      grid[[centered_col]] <- grid[[v]] - res$mx[v]
-    }
+    predictions <- tryCatch(res$predictor(grid)$mean, error = function(e) rep(NA_real_, nrow(grid)))
 
-    # Predict using fitted model
-    predictions <- tryCatch({
-      predict(res$fit, newdata = as.data.frame(grid))
-    }, error = function(e) {
-      rep(NA, nrow(grid))
-    })
+    # z_matrix[i, j] = f(x1[j], x2[i]) as expected by plotly (x → columns)
+    z_matrix <- t(matrix(predictions, nrow = n1, ncol = n2))
 
-    # Reshape for surface plot
-    # expand.grid order: x1 varies fastest (rows 1:n1 have x2[1])
-    # matrix(byrow=FALSE) fills column-by-column: z[i,j] = f(x1[i], x2[j])
-    # plotly add_surface expects: z[i,j] at position (x[j], y[i])
-    # So we need z[i,j] = f(x1[j], x2[i]), which requires transpose
-    z_matrix <- matrix(predictions, nrow = n1, ncol = n2, byrow = FALSE)
-    z_matrix <- t(z_matrix)
+    list(
+      var1 = var1, var2 = var2,
+      x1_seq = x1_seq, x2_seq = x2_seq, z = z_matrix,
+      x1_data = x1_data, x2_data = x2_data,
+      target = res$target_name %||% "Y",
+      x1_ticks = surface_axis_ticks(var1, cm),
+      x2_ticks = surface_axis_ticks(var2, cm)
+    )
+  })
 
-    # Create 3D surface plot
+  # Hover text for observed points / BO optimum
+  surface_point_text <- function(sd, y) {
+    sprintf("%s=%s<br>%s=%s<br>%s=%s",
+            htmltools::htmlEscape(sd$var1), formatC(sd$x1_data, digits = 4, format = "g"),
+            htmltools::htmlEscape(sd$var2), formatC(sd$x2_data, digits = 4, format = "g"),
+            htmltools::htmlEscape(sd$target), formatC(y, digits = 4, format = "g"))
+  }
+  bo_point <- function(sd) {
+    bo <- rv_bo$result
+    if (is.null(bo) || !(sd$var1 %in% names(bo$best_x)) || !(sd$var2 %in% names(bo$best_x))) return(NULL)
+    list(
+      x = unname(bo$best_x[sd$var1]), y = unname(bo$best_x[sd$var2]), z = bo$best_y,
+      text = sprintf("★ BO最適解<br>%s=%.3f<br>%s=%.3f<br>Y=%.3f",
+                     htmltools::htmlEscape(sd$var1), bo$best_x[sd$var1],
+                     htmltools::htmlEscape(sd$var2), bo$best_x[sd$var2], bo$best_y)
+    )
+  }
+  surface_colorscale <- list(
+    c(0, COLORS$accent_blue),
+    c(0.5, COLORS$accent_purple),
+    c(1, COLORS$accent_red)
+  )
+
+  # 3D Surface plot
+  output$surface_plot <- renderPlotly({
+    sd <- surface_data()
+    if (!is.null(sd$error)) return(plotly_empty() |> layout(title = sd$error))
+
     p <- plot_ly() |>
       add_surface(
-        x = x1_seq,
-        y = x2_seq,
-        z = z_matrix,
-        colorscale = list(
-          c(0, COLORS$accent_blue),
-          c(0.5, COLORS$accent_purple),
-          c(1, COLORS$accent_red)
-        ),
+        x = sd$x1_seq,
+        y = sd$x2_seq,
+        z = sd$z,
+        colorscale = surface_colorscale,
         opacity = 0.85,
         name = "応答曲面",
         showscale = TRUE,
-        colorbar = list(title = input$target_var %||% "Y")
+        colorbar = list(title = sd$target)
       )
 
-    # Add actual data points if requested
-    if (show_points) {
+    if (isTRUE(input$surface_show_points)) {
       p <- p |>
         add_markers(
-          x = x1_data,
-          y = x2_data,
-          z = res$y,
+          x = sd$x1_data,
+          y = sd$x2_data,
+          z = rv$analysis$y,
           marker = list(
             size = 5,
             color = COLORS$accent_green,
             line = list(color = COLORS$text_primary, width = 1)
           ),
           name = "実測値",
-          text = sprintf("%s=%.2f<br>%s=%.2f<br>%s=%.2f",
-                        var1, x1_data, var2, x2_data,
-                        input$target_var %||% "Y", res$y),
+          text = surface_point_text(sd, rv$analysis$y),
           hoverinfo = "text"
         )
     }
 
-    # Add BO optimal point (star marker)
-    bo <- rv_bo$result
-    if (!is.null(bo) && var1 %in% names(bo$best_x) && var2 %in% names(bo$best_x)) {
-      opt_x1 <- bo$best_x[var1]
-      opt_x2 <- bo$best_x[var2]
+    bp <- bo_point(sd)
+    if (!is.null(bp)) {
       p <- p |>
         add_markers(
-          x = opt_x1, y = opt_x2, z = bo$best_y,
+          x = bp$x, y = bp$y, z = bp$z,
           marker = list(
             size = 14, color = "#FFD700", symbol = "diamond",
             line = list(color = "#FF4500", width = 2)
           ),
           name = "BO最適解",
-          text = sprintf("★ BO最適解<br>%s=%.3f<br>%s=%.3f<br>Y=%.3f",
-                         var1, opt_x1, var2, opt_x2, bo$best_y),
+          text = bp$text,
           hoverinfo = "text"
         )
     }
 
-    # Layout (dummy/categorical axes get tick labels showing level names)
-    x1_ticks <- surface_axis_ticks(var1, cm)
-    x2_ticks <- surface_axis_ticks(var2, cm)
-    xaxis_cfg <- c(list(title = var1, color = COLORS$text_primary, gridcolor = COLORS$border), x1_ticks)
-    yaxis_cfg <- c(list(title = var2, color = COLORS$text_primary, gridcolor = COLORS$border), x2_ticks)
+    # Dummy/categorical axes get tick labels showing level names
+    xaxis_cfg <- c(list(title = sd$var1, color = COLORS$text_primary, gridcolor = COLORS$border), sd$x1_ticks)
+    yaxis_cfg <- c(list(title = sd$var2, color = COLORS$text_primary, gridcolor = COLORS$border), sd$x2_ticks)
     p |>
       layout(
         scene = list(
           xaxis = xaxis_cfg,
           yaxis = yaxis_cfg,
-          zaxis = list(title = input$target_var %||% "Y", color = COLORS$text_primary, gridcolor = COLORS$border),
+          zaxis = list(title = sd$target, color = COLORS$text_primary, gridcolor = COLORS$border),
           bgcolor = "transparent",
           camera = list(eye = list(x = 1.5, y = 1.5, z = 1.2))
         ),
@@ -3721,158 +3455,59 @@ server <- function(input, output, session) {
 
   # Contour plot
   output$contour_plot <- renderPlotly({
-    req(rv$analysis, input$surface_var1, input$surface_var2)
-    res <- rv$analysis
+    sd <- surface_data()
+    if (!is.null(sd$error)) return(plotly_empty() |> layout(title = sd$error))
 
-    var1 <- input$surface_var1
-    var2 <- input$surface_var2
-
-    if (var1 == var2) {
-      return(plotly_empty() |> layout(title = "X軸とY軸に異なる変数を選択してください"))
-    }
-
-    var_names <- res$var_names
-    cm <- rv$categorical_mapping
-    resolution <- input$surface_resolution %||% 25
-    show_points <- isTRUE(input$surface_show_points)
-
-    # Get data ranges
-    x1_data <- res$X[, var1]
-    x2_data <- res$X[, var2]
-    x1_range <- range(x1_data, na.rm = TRUE)
-    x2_range <- range(x2_data, na.rm = TRUE)
-
-    # Expand range only if extrapolation is allowed (default: within data range only)
-    allow_extrap <- isTRUE(input$surface_allow_extrapolation)
-    x1_expand <- if (allow_extrap) diff(x1_range) * 0.1 else 0
-    x2_expand <- if (allow_extrap) diff(x2_range) * 0.1 else 0
-
-    # Dummy/discrete axes are shown at their actual levels (e.g. {0,1}) instead
-    # of an interpolated continuous grid, which would be meaningless for them
-    var_types <- detect_variable_types(res$X)
-    x1_is_snapped <- !is.na(var_types[var1]) && var_types[var1] %in% c("dummy", "discrete")
-    x2_is_snapped <- !is.na(var_types[var2]) && var_types[var2] %in% c("dummy", "discrete")
-    x1_seq <- if (x1_is_snapped) sort(unique(x1_data)) else
-      seq(x1_range[1] - x1_expand, x1_range[2] + x1_expand, length.out = resolution)
-    x2_seq <- if (x2_is_snapped) sort(unique(x2_data)) else
-      seq(x2_range[1] - x2_expand, x2_range[2] + x2_expand, length.out = resolution)
-    n1 <- length(x1_seq)
-    n2 <- length(x2_seq)
-
-    # Create prediction grid
-    grid <- expand.grid(x1 = x1_seq, x2 = x2_seq)
-    names(grid) <- c(var1, var2)
-
-    # Set other variables: complete categorical groups from their dropdown,
-    # leftover continuous/discrete variables from their slider (or mean)
-    other_vars <- setdiff(var_names, c(var1, var2))
-    parts <- partition_surface_vars(other_vars, cm)
-    for (v in parts$leftover) {
-      slider_id <- paste0("surface_slider_", v)
-      slider_val <- input[[slider_id]]
-      if (is.null(slider_val)) {
-        slider_val <- mean(res$X[, v], na.rm = TRUE)
-      }
-      grid[[v]] <- slider_val
-    }
-    for (cat_name in names(parts$cat_groups)) {
-      dcols <- parts$cat_groups[[cat_name]]
-      info <- cm[[cat_name]]
-      sel_level <- input[[paste0("surface_cat_", make.names(cat_name))]] %||% info$levels[1]
-      for (dc in dcols) {
-        lvl <- sub(paste0("^", cat_name, "_"), "", dc)
-        grid[[dc]] <- as.integer(identical(lvl, sel_level))
-      }
-    }
-
-    grid <- grid[, var_names, drop = FALSE]
-
-    # Add centered columns for quadratic terms (Xi_c = Xi - mean(Xi))
-    # Uses original training data means from res$mx
-    for (v in var_names) {
-      centered_col <- paste0(v, "_c")
-      grid[[centered_col]] <- grid[[v]] - res$mx[v]
-    }
-
-    predictions <- tryCatch({
-      predict(res$fit, newdata = as.data.frame(grid))
-    }, error = function(e) {
-      rep(NA, nrow(grid))
-    })
-
-    # Reshape for contour plot (same logic as surface plot)
-    # expand.grid order: x1 varies fastest -> matrix column-by-column -> transpose for plotly
-    z_matrix <- matrix(predictions, nrow = n1, ncol = n2, byrow = FALSE)
-    z_matrix <- t(z_matrix)
-
-    # Create contour plot
     p <- plot_ly() |>
       add_contour(
-        x = x1_seq,
-        y = x2_seq,
-        z = z_matrix,
-        colorscale = list(
-          c(0, COLORS$accent_blue),
-          c(0.5, COLORS$accent_purple),
-          c(1, COLORS$accent_red)
-        ),
+        x = sd$x1_seq,
+        y = sd$x2_seq,
+        z = sd$z,
+        colorscale = surface_colorscale,
         contours = list(
           showlabels = TRUE,
           labelfont = list(color = COLORS$text_primary, size = 10)
         ),
         name = "等高線",
         showscale = TRUE,
-        colorbar = list(title = input$target_var %||% "Y")
+        colorbar = list(title = sd$target)
       )
 
-    # Add actual data points
-    if (show_points) {
+    if (isTRUE(input$surface_show_points)) {
       p <- p |>
         add_markers(
-          x = x1_data,
-          y = x2_data,
+          x = sd$x1_data,
+          y = sd$x2_data,
           marker = list(
             size = 8,
-            color = res$y,
-            colorscale = list(
-              c(0, COLORS$accent_blue),
-              c(0.5, COLORS$accent_purple),
-              c(1, COLORS$accent_red)
-            ),
+            color = rv$analysis$y,
+            colorscale = surface_colorscale,
             line = list(color = COLORS$text_primary, width = 1),
             showscale = FALSE
           ),
           name = "実測値",
-          text = sprintf("%s=%.2f<br>%s=%.2f<br>%s=%.2f",
-                        var1, x1_data, var2, x2_data,
-                        input$target_var %||% "Y", res$y),
+          text = surface_point_text(sd, rv$analysis$y),
           hoverinfo = "text"
         )
     }
 
-    # Add BO optimal point (star marker)
-    bo <- rv_bo$result
-    if (!is.null(bo) && var1 %in% names(bo$best_x) && var2 %in% names(bo$best_x)) {
-      opt_x1 <- bo$best_x[var1]
-      opt_x2 <- bo$best_x[var2]
+    bp <- bo_point(sd)
+    if (!is.null(bp)) {
       p <- p |>
         add_markers(
-          x = opt_x1, y = opt_x2,
+          x = bp$x, y = bp$y,
           marker = list(
             size = 16, color = "#FFD700", symbol = "star",
             line = list(color = "#FF4500", width = 2)
           ),
           name = "BO最適解",
-          text = sprintf("★ BO最適解<br>%s=%.3f<br>%s=%.3f<br>Y=%.3f",
-                         var1, opt_x1, var2, opt_x2, bo$best_y),
+          text = bp$text,
           hoverinfo = "text"
         )
     }
 
-    x1_ticks <- surface_axis_ticks(var1, cm)
-    x2_ticks <- surface_axis_ticks(var2, cm)
-    xaxis_cfg <- c(list(title = var1, color = COLORS$text_primary, gridcolor = COLORS$border), x1_ticks)
-    yaxis_cfg <- c(list(title = var2, color = COLORS$text_primary, gridcolor = COLORS$border), x2_ticks)
+    xaxis_cfg <- c(list(title = sd$var1, color = COLORS$text_primary, gridcolor = COLORS$border), sd$x1_ticks)
+    yaxis_cfg <- c(list(title = sd$var2, color = COLORS$text_primary, gridcolor = COLORS$border), sd$x2_ticks)
     p |>
       layout(
         xaxis = xaxis_cfg,
@@ -3890,7 +3525,6 @@ server <- function(input, output, session) {
 
   # Reactive value for BO results
   rv_bo <- reactiveValues(result = NULL)
-
 
   # Best solution display
   output$bo_best_display <- renderUI({
@@ -3918,80 +3552,49 @@ server <- function(input, output, session) {
     )
     # For target mode, also show deviation
     if (use_target) {
-      deviation <- abs(bo$best_y - bo$target_value)
       y_box <- tagList(
         y_box,
         div(
           class = "metric-box",
           style = sprintf("border-color: %s;", COLORS$accent_orange),
           div(class = "metric-label", "目標との偏差"),
-          div(class = "metric-value", smart_format(deviation))
+          div(class = "metric-value", smart_format(abs(bo$best_y - bo$target_value)))
         )
       )
     }
 
-    # Build reverse mapping: dummy_col -> { cat_name, level }
     cm <- bo$categorical_mapping
-    dummy_to_cat <- list()
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        for (dc in info$dummy_cols) {
-          # Extract level name from dummy column: "Material_B" -> "B"
-          lvl <- sub(paste0("^", cat_name, "_"), "", dc)
-          dummy_to_cat[[dc]] <- list(cat_name = cat_name, level = lvl, reference = info$reference)
-        }
-      }
-    }
-
-    # Reconstruct categorical variables from dummy groups, then show non-dummy vars
     vt <- bo$var_types
     var_boxes <- list()
 
     # [1] Categorical variables -- reconstructed from dummies
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        # Find which dummy is 1 (if any); otherwise reference level
-        active_level <- info$reference
-        for (dc in info$dummy_cols) {
-          if (!is.na(bo$best_x[dc]) && bo$best_x[dc] == 1) {
-            active_level <- sub(paste0("^", cat_name, "_"), "", dc)
-            break
-          }
-        }
-        var_boxes <- c(var_boxes, list(div(
-          class = "metric-box",
-          div(class = "metric-label", cat_name,
-              tags$span(style = sprintf("font-size: 0.6rem; color: %s;", COLORS$accent_purple), " [カテゴリ]")),
-          div(class = "metric-value", style = sprintf("color: %s;", COLORS$accent_blue),
-              active_level)
-        )))
-      }
+    for (cat_name in names(cm)) {
+      var_boxes <- c(var_boxes, list(div(
+        class = "metric-box",
+        div(class = "metric-label", cat_name,
+            tags$span(style = sprintf("font-size: 0.6rem; color: %s;", COLORS$accent_purple), " [カテゴリ]")),
+        div(class = "metric-value", style = sprintf("color: %s;", COLORS$accent_blue),
+            decode_category(cm[[cat_name]], bo$best_x))
+      )))
     }
 
     # [2] Non-dummy variables -- continuous, discrete
     dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
     for (v in names(bo$best_x)) {
-      if (v %in% dummy_cols) next  # Skip individual dummies
-      val <- bo$best_x[v]
-      type_tag <- if (!is.null(vt) && !is.na(vt[v]) && vt[v] == "discrete") {
+      if (v %in% dummy_cols) next
+      val <- bo$best_x[[v]]
+      is_discrete <- !is.null(vt) && !is.na(vt[v]) && vt[v] == "discrete"
+      type_tag <- if (is_discrete) {
         tags$span(style = sprintf("font-size: 0.6rem; color: %s;", COLORS$accent_orange), " [離散]")
       } else NULL
-      display_val <- if (!is.null(vt) && !is.na(vt[v]) && vt[v] == "discrete") {
-        as.character(as.integer(val))
-      } else {
-        smart_format(val)
-      }
+      display_val <- if (is_discrete) as.character(round(val)) else smart_format(val)
       var_boxes <- c(var_boxes, list(div(
         class = "metric-box",
         div(class = "metric-label", v, type_tag),
-        div(class = "metric-value", style = sprintf("color: %s;", COLORS$accent_blue),
-            display_val)
+        div(class = "metric-value", style = sprintf("color: %s;", COLORS$accent_blue), display_val)
       )))
     }
 
-    # Info boxes
     dir_display <- if (use_target) {
       sprintf("目標値: %s", smart_format(bo$target_value))
     } else direction_text
@@ -4004,13 +3607,7 @@ server <- function(input, output, session) {
           div(class = "metric-value", style = "font-size: 1rem;", dir_display))
     )
 
-    tagList(
-      div(class = "metric-grid",
-          y_box,
-          var_boxes,
-          info_boxes
-      )
-    )
+    tagList(div(class = "metric-grid", y_box, var_boxes, info_boxes))
   })
 
   # Convergence plot
@@ -4028,7 +3625,6 @@ server <- function(input, output, session) {
       labs(x = "反復回数", y = direction_label) +
       theme_rsm()
 
-    # Add target line if in target mode
     if (!is.null(bo$target_value)) {
       p <- p + geom_hline(yintercept = bo$target_value, linetype = "dashed",
                           color = COLORS$accent_orange, linewidth = 0.8)
@@ -4042,7 +3638,7 @@ server <- function(input, output, session) {
     req(rv_bo$result)
     bo <- rv_bo$result
 
-    # Remove initial row (EI = NA)
+    # Remove rows without EI (initial point / final local refinement)
     hist_ei <- bo$history[!is.na(bo$history$EI), ]
 
     if (nrow(hist_ei) == 0) {
@@ -4064,47 +3660,33 @@ server <- function(input, output, session) {
     bo <- rv_bo$result
 
     df <- bo$history
-    # Format type column in Japanese (base R for dplyr version compatibility)
     type_labels <- c("initial" = "初期最良", "improved" = "改善", "explored" = "探索")
     matched <- type_labels[df$type]
     df$type <- ifelse(is.na(matched), df$type, matched)
 
     # Reconstruct categorical variables from dummy columns
     cm <- bo$categorical_mapping
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        dummies <- info$dummy_cols
-        existing <- intersect(dummies, names(df))
-        if (length(existing) == 0) next
-        # Determine active level per row
-        cat_col <- rep(info$reference, nrow(df))
-        for (dc in existing) {
-          lvl <- sub(paste0("^", cat_name, "_"), "", dc)
-          active_rows <- !is.na(df[[dc]]) & df[[dc]] == 1
-          cat_col[active_rows] <- lvl
-        }
-        # Remove dummy columns, insert categorical column
-        first_pos <- min(which(names(df) %in% existing))
-        df[existing] <- NULL
-        # Insert at the position where first dummy was
-        if (first_pos > ncol(df)) {
-          df[[cat_name]] <- cat_col
-        } else {
-          before <- df[, seq_len(first_pos - 1), drop = FALSE]
-          after <- df[, seq(first_pos, ncol(df)), drop = FALSE]
-          df <- cbind(before, setNames(data.frame(cat_col, stringsAsFactors = FALSE), cat_name), after)
-        }
+    for (cat_name in names(cm)) {
+      info <- cm[[cat_name]]
+      existing <- intersect(info$dummy_cols, names(df))
+      if (length(existing) == 0) next
+      cat_col <- rep(info$reference, nrow(df))
+      for (dc in existing) {
+        active_rows <- !is.na(df[[dc]]) & df[[dc]] == 1
+        cat_col[active_rows] <- dummy_level(info, dc)
       }
+      # Replace the dummy columns by one categorical column at the same position
+      first_pos <- min(which(names(df) %in% existing))
+      df[existing] <- NULL
+      new_col <- setNames(data.frame(cat_col, stringsAsFactors = FALSE), cat_name)
+      after_idx <- if (first_pos <= ncol(df)) first_pos:ncol(df) else integer(0)
+      df <- cbind(df[, seq_len(first_pos - 1), drop = FALSE], new_col,
+                  df[, after_idx, drop = FALSE])
     }
 
-    # Round numeric columns
     num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
-    for (col in num_cols) {
-      df[[col]] <- round(df[[col]], 6)
-    }
+    for (col in num_cols) df[[col]] <- round(df[[col]], 6)
 
-    # Rename columns for display
     col_rename <- c(
       "iteration" = "反復",
       "predicted_y" = "予測Y",
@@ -4145,47 +3727,38 @@ server <- function(input, output, session) {
   # PREDICTION SIMULATOR
   # =========================================================================
 
+  # Index-based input IDs (see surface_slider_id)
+  pred_var_id <- function(res, v) sprintf("pred_%d_v%d", res$run_id, match(v, res$var_names))
+  pred_cat_id <- function(res, cat_name) sprintf("pred_%d_c%d", res$run_id, match(cat_name, names(res$cm)))
+
   # Dynamic input UI for prediction
   output$pred_input_ui <- renderUI({
     req(rv$analysis)
     res <- rv$analysis
-    var_names <- res$var_names
-    cm <- rv$categorical_mapping
+    cm <- res$cm
     dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
 
+    box <- function(...) div(style = "display: inline-block; width: 140px; margin-right: 8px; vertical-align: top;", ...)
     inputs <- list()
 
     # Categorical variable selectors
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        all_levels <- info$levels
-        inputs <- c(inputs, list(
-          div(style = "display: inline-block; width: 140px; margin-right: 8px; vertical-align: top;",
-              selectInput(
-                paste0("pred_", cat_name), cat_name,
-                choices = all_levels, selected = all_levels[1],
-                width = "100%"
-              ))
-        ))
-      }
+    for (cat_name in names(cm)) {
+      lv <- cm[[cat_name]]$levels
+      inputs <- c(inputs, list(box(
+        selectInput(pred_cat_id(res, cat_name), cat_name, choices = lv, selected = lv[1], width = "100%")
+      )))
     }
 
     # Continuous/discrete variable inputs
-    for (v in var_names) {
+    for (v in res$var_names) {
       if (v %in% dummy_cols) next
       x_col <- res$X[, v]
-      x_mean <- mean(x_col, na.rm = TRUE)
-      x_step <- diff(range(x_col, na.rm = TRUE)) / 20
+      x_step <- diff(range(x_col)) / 20
       if (x_step == 0) x_step <- 1
-      inputs <- c(inputs, list(
-        div(style = "display: inline-block; width: 140px; margin-right: 8px; vertical-align: top;",
-            numericInput(
-              paste0("pred_", v), v,
-              value = round(x_mean, 4), step = round(x_step, 4),
-              width = "100%"
-            ))
-      ))
+      inputs <- c(inputs, list(box(
+        numericInput(pred_var_id(res, v), v,
+                     value = signif(mean(x_col), 6), step = signif(x_step, 2), width = "100%")
+      )))
     }
 
     div(style = "display: flex; flex-wrap: wrap; gap: 4px; padding: 0.5rem 0;", inputs)
@@ -4194,29 +3767,18 @@ server <- function(input, output, session) {
   # Fill with BO optimal values
   observeEvent(input$pred_fill_bo, {
     req(rv$analysis, rv_bo$result)
+    res <- rv$analysis
     bo <- rv_bo$result
-    cm <- rv$categorical_mapping
+    cm <- res$cm
 
-    # Set categorical selectors
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        active_level <- info$reference
-        for (dc in info$dummy_cols) {
-          if (!is.na(bo$best_x[dc]) && bo$best_x[dc] == 1) {
-            active_level <- sub(paste0("^", cat_name, "_"), "", dc)
-            break
-          }
-        }
-        updateSelectInput(session, paste0("pred_", cat_name), selected = active_level)
-      }
+    for (cat_name in names(cm)) {
+      updateSelectInput(session, pred_cat_id(res, cat_name),
+                        selected = decode_category(cm[[cat_name]], bo$best_x))
     }
-
-    # Set numeric inputs
     dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
-    for (v in names(bo$best_x)) {
+    for (v in intersect(names(bo$best_x), res$var_names)) {
       if (v %in% dummy_cols) next
-      updateNumericInput(session, paste0("pred_", v), value = round(bo$best_x[v], 4))
+      updateNumericInput(session, pred_var_id(res, v), value = signif(bo$best_x[[v]], 8))
     }
   })
 
@@ -4224,19 +3786,15 @@ server <- function(input, output, session) {
   observeEvent(input$pred_fill_mean, {
     req(rv$analysis)
     res <- rv$analysis
-    cm <- rv$categorical_mapping
+    cm <- res$cm
 
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        updateSelectInput(session, paste0("pred_", cat_name), selected = cm[[cat_name]]$levels[1])
-      }
+    for (cat_name in names(cm)) {
+      updateSelectInput(session, pred_cat_id(res, cat_name), selected = cm[[cat_name]]$levels[1])
     }
-
     dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
     for (v in res$var_names) {
       if (v %in% dummy_cols) next
-      updateNumericInput(session, paste0("pred_", v),
-                         value = round(mean(res$X[, v], na.rm = TRUE), 4))
+      updateNumericInput(session, pred_var_id(res, v), value = signif(mean(res$X[, v]), 6))
     }
   })
 
@@ -4245,39 +3803,27 @@ server <- function(input, output, session) {
     req(rv$analysis)
     res <- rv$analysis
     var_names <- res$var_names
-    cm <- rv$categorical_mapping
+    cm <- res$cm
     dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
 
     # Build new data row from inputs
-    new_row <- list()
-    for (v in var_names) {
-      if (v %in% dummy_cols) next
-      val <- input[[paste0("pred_", v)]]
-      if (is.null(val) || is.na(val)) return(NULL)
-      new_row[[v]] <- val
+    x_new <- setNames(numeric(length(var_names)), var_names)
+    for (v in setdiff(var_names, dummy_cols)) {
+      val <- input[[pred_var_id(res, v)]]
+      if (is.null(val) || !is.numeric(val) || !is.finite(val)) return(NULL)
+      x_new[v] <- val
+    }
+    for (cat_name in names(cm)) {
+      info <- cm[[cat_name]]
+      selected_level <- input[[pred_cat_id(res, cat_name)]]
+      if (is.null(selected_level)) return(NULL)
+      x_new[info$dummy_cols] <- as.numeric(info$dummy_levels == selected_level)
     }
 
-    # Reconstruct dummy columns from categorical selectors
-    if (!is.null(cm)) {
-      for (cat_name in names(cm)) {
-        info <- cm[[cat_name]]
-        selected_level <- input[[paste0("pred_", cat_name)]]
-        if (is.null(selected_level)) return(NULL)
-        for (dc in info$dummy_cols) {
-          lvl <- sub(paste0("^", cat_name, "_"), "", dc)
-          new_row[[dc]] <- if (lvl == selected_level) 1 else 0
-        }
-      }
-    }
-
-    # Reorder to match var_names
-    newdata <- as.data.frame(new_row[var_names], stringsAsFactors = FALSE, check.names = FALSE)
-
-    # Predict
-    pred <- tryCatch({
-      rsm_predict_with_se(res$fit, newdata, res$mx, var_names)
-    }, error = function(e) NULL)
-
+    pred <- tryCatch(
+      res$predictor(matrix(x_new, nrow = 1, dimnames = list(NULL, var_names))),
+      error = function(e) NULL
+    )
     if (is.null(pred)) {
       return(p(style = sprintf("color: %s;", COLORS$text_muted), "予測計算中..."))
     }
@@ -4286,13 +3832,14 @@ server <- function(input, output, session) {
     se <- pred$se[1]
     res_se <- pred$residual_se
     # 95% prediction interval: y_hat +/- t * sqrt(se^2 + residual_se^2)
-    n <- nrow(res$X)
-    p_terms <- length(coef(res$fit))
-    df_resid <- n - p_terms
-    t_val <- if (df_resid > 0) qt(0.975, df_resid) else 1.96
-    pi_half <- t_val * sqrt(se^2 + res_se^2)
+    df_resid <- res$fit$df.residual
+    pi_text <- if (df_resid > 0 && is.finite(res_se)) {
+      pi_half <- qt(0.975, df_resid) * sqrt(se^2 + res_se^2)
+      sprintf("%s ~ %s", smart_format(y_hat - pi_half), smart_format(y_hat + pi_half))
+    } else {
+      "N/A (残差自由度なし)"
+    }
 
-    # Display
     div(
       style = sprintf("background: %s; border: 1px solid %s; border-radius: 8px; padding: 1rem; margin-top: 0.5rem;",
                       COLORS$bg_secondary, COLORS$border),
@@ -4304,12 +3851,11 @@ server <- function(input, output, session) {
           ),
           div(
             span(style = sprintf("color: %s; font-size: 0.75rem;", COLORS$text_muted), "95%予測区間"),
-            div(style = sprintf("font-size: 1rem; color: %s;", COLORS$text_primary),
-                sprintf("%s ~ %s", smart_format(y_hat - pi_half), smart_format(y_hat + pi_half)))
+            div(style = sprintf("font-size: 1rem; color: %s;", COLORS$text_primary), pi_text)
           ),
           div(
             span(style = sprintf("color: %s; font-size: 0.75rem;", COLORS$text_muted), "SE"),
-            div(style = sprintf("font-size: 0.9rem; color: %s;", COLORS$text_secondary),
+            div(style = sprintf("font-size: 0.9rem; color: %s;", COLORS$text_muted),
                 smart_format(se))
           )
       )
@@ -4323,38 +3869,25 @@ server <- function(input, output, session) {
     },
     content = function(file) {
       bo <- rv_bo$result
-      if (is.null(bo)) return()
+      if (is.null(bo)) {
+        write.csv(data.frame(message = "no optimization result"), file, row.names = FALSE)
+        return(invisible())
+      }
 
       cm <- bo$categorical_mapping
-
-      # Build optimal solution row with reverse-mapped categories
-      best_row <- list()
       dummy_cols <- unlist(lapply(cm, function(x) x$dummy_cols))
+      best_row <- list()
 
-      # Categorical variables first
-      if (!is.null(cm)) {
-        for (cat_name in names(cm)) {
-          info <- cm[[cat_name]]
-          active_level <- info$reference
-          for (dc in info$dummy_cols) {
-            if (!is.na(bo$best_x[dc]) && bo$best_x[dc] == 1) {
-              active_level <- sub(paste0("^", cat_name, "_"), "", dc)
-              break
-            }
-          }
-          best_row[[cat_name]] <- active_level
-        }
+      # Categorical variables first (decoded from dummies)
+      for (cat_name in names(cm)) {
+        best_row[[cat_name]] <- decode_category(cm[[cat_name]], bo$best_x)
       }
-
-      # Continuous/discrete variables
       for (v in names(bo$best_x)) {
         if (v %in% dummy_cols) next
-        best_row[[v]] <- bo$best_x[v]
+        best_row[[v]] <- unname(bo$best_x[v])
       }
-
       best_row[["predicted_Y"]] <- bo$best_y
 
-      # Direction info
       if (!is.null(bo$target_value)) {
         best_row[["optimization"]] <- paste0("target=", bo$target_value)
         best_row[["deviation"]] <- abs(bo$best_y - bo$target_value)
@@ -4363,7 +3896,11 @@ server <- function(input, output, session) {
       }
 
       df <- as.data.frame(best_row, stringsAsFactors = FALSE, check.names = FALSE)
-      write.csv(df, file, row.names = FALSE)
+      # UTF-8 with BOM so Excel opens Japanese headers correctly
+      con <- file(file, open = "wb")
+      on.exit(close(con))
+      writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)
+      write.csv(df, con, row.names = FALSE, fileEncoding = "")
     }
   )
 }
